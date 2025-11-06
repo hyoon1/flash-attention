@@ -34,6 +34,7 @@ fmha_fwd_splitkv_traits get_ck_fmha_fwd_splitkv_traits(const mask_info &mask,
                                    dtype,
                                    false, // is_group_mode
                                    true, // is_v_rowmajor
+			           false, // has_logits_soft_cap
                                    mask.type,
                                    enable_alibi ? bias_enum::alibi : bias_enum::no_bias,
                                    has_lse,
@@ -208,8 +209,9 @@ fmha_fwd_splitkv_args get_ck_fmha_fwd_splitkv_args(bool has_lse,
     args.num_splits = num_splits;
 
     args.scale_s = softmax_scale;
-    args.scale_p = 1;
-    args.scale_o = 1;
+    args.scale_p = 1.0f;
+    args.scale_o = 1.0f;
+    args.logits_soft_cap = 0.0f;
 
     args.batch_stride_q = q.stride(0);
     args.stride_q = q.stride(1);

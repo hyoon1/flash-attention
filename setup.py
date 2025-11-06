@@ -132,7 +132,8 @@ def rename_cpp_to_cu(cpp_files):
 
 def validate_and_update_archs(archs):
     # List of allowed architectures
-    allowed_archs = ["native", "gfx90a", "gfx940", "gfx941", "gfx942"]
+    #allowed_archs = ["native", "gfx90a", "gfx940", "gfx941", "gfx942"]
+    allowed_archs = ["native", "gfx1201"]
 
     # Validate if each element in archs is in allowed_archs
     assert all(
@@ -332,10 +333,12 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
         if not os.path.exists("./build"):
             os.makedirs("build")
 
+        # Only generate basic forward kernels to avoid compilation issues
         subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd", "--output_dir", "build", "--receipt", "2"], check=True)
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd_appendkv", "--output_dir", "build", "--receipt", "2"], check=True)
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd_splitkv", "--output_dir", "build", "--receipt", "2"], check=True)
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "bwd", "--output_dir", "build", "--receipt", "2"], check=True)
+        # Disabled: fwd_appendkv, fwd_splitkv, and bwd to avoid compiler errors
+        # subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd_appendkv", "--output_dir", "build", "--receipt", "2"], check=True)
+        # subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd_splitkv", "--output_dir", "build", "--receipt", "2"], check=True)
+        # subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "bwd", "--output_dir", "build", "--receipt", "2"], check=True)
 
         # Check, if ATen/CUDAGeneratorImpl.h is found, otherwise use ATen/cuda/CUDAGeneratorImpl.h
         # See https://github.com/pytorch/pytorch/pull/70650
@@ -356,25 +359,22 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
         if FORCE_CXX11_ABI:
             torch._C._GLIBCXX_USE_CXX11_ABI = True
 
+        # Exclude backward source files when FLASHATTENTION_DISABLE_BACKWARD is enabled
         sources = ["csrc/flash_attn_ck/flash_api.cpp",
                 "csrc/flash_attn_ck/flash_common.cpp",
-                "csrc/flash_attn_ck/mha_bwd.cpp",
                 "csrc/flash_attn_ck/mha_fwd_kvcache.cpp",
                 "csrc/flash_attn_ck/mha_fwd.cpp",
-                "csrc/flash_attn_ck/mha_varlen_bwd.cpp",
                 "csrc/flash_attn_ck/mha_varlen_fwd.cpp"] + glob.glob(
-            f"build/fmha_*wd*.cpp"
+            f"build/fmha_fwd*.cpp"
         )
 
         rename_cpp_to_cu(sources)
 
         renamed_sources = ["csrc/flash_attn_ck/flash_api.cu",
                         "csrc/flash_attn_ck/flash_common.cu",
-                        "csrc/flash_attn_ck/mha_bwd.cu",
                         "csrc/flash_attn_ck/mha_fwd_kvcache.cu",
                         "csrc/flash_attn_ck/mha_fwd.cu",
-                        "csrc/flash_attn_ck/mha_varlen_bwd.cu",
-                        "csrc/flash_attn_ck/mha_varlen_fwd.cu"] + glob.glob(f"build/fmha_*wd*.cu")
+                        "csrc/flash_attn_ck/mha_varlen_fwd.cu"] + glob.glob(f"build/fmha_fwd*.cu")
 
         cc_flag += ["-O3","-std=c++17",
                     "-DCK_TILE_FMHA_FWD_FAST_EXP2=1",
@@ -388,7 +388,7 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
                     "-DCK_ENABLE_INT8",
                     "-DCK_USE_XDL",
                     "-DUSE_PROF_API=1",
-                    # "-DFLASHATTENTION_DISABLE_BACKWARD",
+                    "-DFLASHATTENTION_DISABLE_BACKWARD",
                     "-D__HIP_PLATFORM_HCC__=1"]
 
         cc_flag += [f"-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get('CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT', 3)}"]

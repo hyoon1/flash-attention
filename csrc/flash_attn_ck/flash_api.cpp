@@ -42,6 +42,7 @@ mha_varlen_fwd(at::Tensor &q,                               // total_q x num_hea
                const bool return_softmax,
                std::optional<at::Generator> gen_);
 
+#ifndef FLASHATTENTION_DISABLE_BACKWARD
 std::vector<at::Tensor>
 mha_bwd(const at::Tensor &dout,                   // batch_size x seqlen_q x num_heads, x multiple_of(head_size_og, 8)
         const at::Tensor &q,                      // batch_size x seqlen_q x num_heads x head_size
@@ -88,6 +89,7 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
                const bool deterministic,
                std::optional<at::Generator> gen_,
                std::optional<at::Tensor> &rng_state);
+#endif
 
 std::vector<at::Tensor>
 mha_fwd_kvcache(at::Tensor &q,                                     // batch_size x seqlen_q x num_heads x head_size
@@ -115,8 +117,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
         m.doc() = "FlashAttention";
         m.def("fwd", &mha_fwd, "Forward pass");
-        m.def("varlen_fwd", &mha_varlen_fwd, "Forward pass (variable length)");
+        // varlen_fwd disabled - requires fwd_splitkv kernels which are not generated
+        // m.def("varlen_fwd", &mha_varlen_fwd, "Forward pass (variable length)");
+#ifndef FLASHATTENTION_DISABLE_BACKWARD
         m.def("bwd", &mha_bwd, "Backward pass");
         m.def("varlen_bwd", &mha_varlen_bwd, "Backward pass (variable length)");
-        m.def("fwd_kvcache", &mha_fwd_kvcache, "Forward pass, with KV-cache");
+#endif
+        // fwd_kvcache disabled - requires fwd_appendkv kernels which are not generated
+        // m.def("fwd_kvcache", &mha_fwd_kvcache, "Forward pass, with KV-cache");
 }

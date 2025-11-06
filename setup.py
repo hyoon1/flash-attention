@@ -333,12 +333,47 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
         if not os.path.exists("./build"):
             os.makedirs("build")
 
+        # Determine GPU targets for kernel generation
+        # Get GPU architecture from environment or detect from installed GPU
+        gpu_archs_env = os.getenv("GPU_ARCHS", "").strip()
+        if gpu_archs_env and gpu_archs_env != "native":
+            # Use explicitly specified architectures
+            kernel_targets = gpu_archs_env.split(";")
+        else:
+            # Auto-detect from rocminfo
+            try:
+                result = subprocess.run(["rocminfo"], capture_output=True, text=True, check=True)
+                # Look for gfx architecture in rocminfo output
+                import re
+                gfx_match = re.search(r'Name:\s+(gfx\d+)', result.stdout)
+                if gfx_match:
+                    detected_arch = gfx_match.group(1)
+                    # Map specific gfx to general target for code generation
+                    if detected_arch.startswith("gfx12"):
+                        kernel_targets = ["gfx1201"]  # Use gfx12 kernel family
+                    elif detected_arch.startswith("gfx94"):
+                        kernel_targets = ["gfx942"]
+                    elif detected_arch.startswith("gfx90"):
+                        kernel_targets = ["gfx90a"]
+                    else:
+                        kernel_targets = [detected_arch]
+                    print(f"Auto-detected GPU architecture: {detected_arch}, using kernel target: {kernel_targets}")
+                else:
+                    print("Warning: Could not detect GPU architecture, defaulting to gfx90a")
+                    kernel_targets = ["gfx90a"]
+            except:
+                print("Warning: rocminfo not available, defaulting to gfx90a")
+                kernel_targets = ["gfx90a"]
+        
+        # Generate kernels with proper target specification
+        targets_arg = ",".join(kernel_targets)
+        
         # Only generate basic forward kernels to avoid compilation issues
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd", "--output_dir", "build", "--receipt", "2"], check=True)
+        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd", "--output_dir", "build", "--receipt", "2", "--targets", targets_arg], check=True)
         # Disabled: fwd_appendkv, fwd_splitkv, and bwd to avoid compiler errors
-        # subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd_appendkv", "--output_dir", "build", "--receipt", "2"], check=True)
-        # subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd_splitkv", "--output_dir", "build", "--receipt", "2"], check=True)
-        # subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "bwd", "--output_dir", "build", "--receipt", "2"], check=True)
+        # subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd_appendkv", "--output_dir", "build", "--receipt", "2", "--targets", targets_arg], check=True)
+        # subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd_splitkv", "--output_dir", "build", "--receipt", "2", "--targets", targets_arg], check=True)
+        # subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "bwd", "--output_dir", "build", "--receipt", "2", "--targets", targets_arg], check=True)
 
         # Check, if ATen/CUDAGeneratorImpl.h is found, otherwise use ATen/cuda/CUDAGeneratorImpl.h
         # See https://github.com/pytorch/pytorch/pull/70650
@@ -359,12 +394,11 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
         if FORCE_CXX11_ABI:
             torch._C._GLIBCXX_USE_CXX11_ABI = True
 
-        # Exclude backward source files when FLASHATTENTION_DISABLE_BACKWARD is enabled
+        # Exclude backward, fwd_kvcache, and varlen_fwd
+        # varlen_fwd uses splitkv which requires fwd_splitkv kernels (not generated)
         sources = ["csrc/flash_attn_ck/flash_api.cpp",
                 "csrc/flash_attn_ck/flash_common.cpp",
-                "csrc/flash_attn_ck/mha_fwd_kvcache.cpp",
-                "csrc/flash_attn_ck/mha_fwd.cpp",
-                "csrc/flash_attn_ck/mha_varlen_fwd.cpp"] + glob.glob(
+                "csrc/flash_attn_ck/mha_fwd.cpp"] + glob.glob(
             f"build/fmha_fwd*.cpp"
         )
 
@@ -372,9 +406,7 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
 
         renamed_sources = ["csrc/flash_attn_ck/flash_api.cu",
                         "csrc/flash_attn_ck/flash_common.cu",
-                        "csrc/flash_attn_ck/mha_fwd_kvcache.cu",
-                        "csrc/flash_attn_ck/mha_fwd.cu",
-                        "csrc/flash_attn_ck/mha_varlen_fwd.cu"] + glob.glob(f"build/fmha_fwd*.cu")
+                        "csrc/flash_attn_ck/mha_fwd.cu"] + glob.glob(f"build/fmha_fwd*.cu")
 
         cc_flag += ["-O3","-std=c++17",
                     "-DCK_TILE_FMHA_FWD_FAST_EXP2=1",

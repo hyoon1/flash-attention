@@ -147,8 +147,13 @@ ext_modules = []
 # We want this even if SKIP_CUDA_BUILD because when we run python setup.py sdist we want the .hpp
 # files included in the source distribution, in case the user compiles from source.
 if os.path.isdir(".git"):
-    subprocess.run(["git", "submodule", "update", "--init", "csrc/composable_kernel"], check=True)
-    subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"], check=True)
+    # Only update submodules if the required files don't exist
+    if IS_ROCM and not USE_TRITON_ROCM:
+        if not os.path.exists("csrc/composable_kernel/example/ck_tile/01_fmha/generate.py"):
+            subprocess.run(["git", "submodule", "update", "--init", "csrc/composable_kernel"], check=True)
+    else:
+        if not os.path.exists("csrc/cutlass/include/cutlass/cutlass.h"):
+            subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"], check=True)
 else:
     if IS_ROCM:
         if not USE_TRITON_ROCM:
@@ -368,11 +373,12 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
         # Generate kernels with proper target specification
         targets_arg = ",".join(kernel_targets)
         
-        # Only generate basic forward kernels to avoid compilation issues
+        # Generate forward kernels
         subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd", "--output_dir", "build", "--receipt", "2", "--targets", targets_arg], check=True)
-        # Disabled: fwd_appendkv, fwd_splitkv, and bwd to avoid compiler errors
+        # Generate fwd_splitkv kernels for varlen_fwd with paged KV cache support
+        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd_splitkv", "--output_dir", "build", "--receipt", "2", "--targets", targets_arg], check=True)
+        # Disabled: fwd_appendkv and bwd to avoid compiler errors
         # subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd_appendkv", "--output_dir", "build", "--receipt", "2", "--targets", targets_arg], check=True)
-        # subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd_splitkv", "--output_dir", "build", "--receipt", "2", "--targets", targets_arg], check=True)
         # subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "bwd", "--output_dir", "build", "--receipt", "2", "--targets", targets_arg], check=True)
 
         # Check, if ATen/CUDAGeneratorImpl.h is found, otherwise use ATen/cuda/CUDAGeneratorImpl.h
@@ -394,11 +400,12 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
         if FORCE_CXX11_ABI:
             torch._C._GLIBCXX_USE_CXX11_ABI = True
 
-        # Exclude backward, fwd_kvcache, and varlen_fwd
-        # varlen_fwd uses splitkv which requires fwd_splitkv kernels (not generated)
+        # Include varlen_fwd now that fwd_splitkv kernels are generated
+        # Exclude backward and fwd_kvcache
         sources = ["csrc/flash_attn_ck/flash_api.cpp",
                 "csrc/flash_attn_ck/flash_common.cpp",
-                "csrc/flash_attn_ck/mha_fwd.cpp"] + glob.glob(
+                "csrc/flash_attn_ck/mha_fwd.cpp",
+                "csrc/flash_attn_ck/mha_varlen_fwd.cpp"] + glob.glob(
             f"build/fmha_fwd*.cpp"
         )
 
@@ -406,7 +413,8 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
 
         renamed_sources = ["csrc/flash_attn_ck/flash_api.cu",
                         "csrc/flash_attn_ck/flash_common.cu",
-                        "csrc/flash_attn_ck/mha_fwd.cu"] + glob.glob(f"build/fmha_fwd*.cu")
+                        "csrc/flash_attn_ck/mha_fwd.cu",
+                        "csrc/flash_attn_ck/mha_varlen_fwd.cu"] + glob.glob(f"build/fmha_fwd*.cu")
 
         cc_flag += ["-O3","-std=c++17",
                     "-DCK_TILE_FMHA_FWD_FAST_EXP2=1",

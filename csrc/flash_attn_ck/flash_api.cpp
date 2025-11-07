@@ -117,8 +117,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
         m.doc() = "FlashAttention";
         m.def("fwd", &mha_fwd, "Forward pass");
-        // varlen_fwd disabled - requires fwd_splitkv kernels which are not generated
-        // m.def("varlen_fwd", &mha_varlen_fwd, "Forward pass (variable length)");
+        m.def("varlen_fwd", &mha_varlen_fwd, "Forward pass (variable length)");
 #ifndef FLASHATTENTION_DISABLE_BACKWARD
         m.def("bwd", &mha_bwd, "Backward pass");
         m.def("varlen_bwd", &mha_varlen_bwd, "Backward pass (variable length)");

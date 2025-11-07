@@ -31,7 +31,8 @@ def benchmark_flash_attn_fwd(
     causal=False,
     dtype=torch.float16,
     device='cuda',
-    repeats=30
+    repeats=50,
+    warmup_iterations=10
 ):
     """
     Benchmark flash_attn_func forward pass only.
@@ -45,6 +46,7 @@ def benchmark_flash_attn_fwd(
         dtype: Data type (float16, bfloat16, etc.)
         device: Device to run on
         repeats: Number of benchmark iterations
+        warmup_iterations: Number of warmup iterations (excluded from results)
     
     Returns:
         time_mean: Mean forward pass time in seconds
@@ -54,6 +56,13 @@ def benchmark_flash_attn_fwd(
     q = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
     k = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
     v = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
+    
+    # Warmup iterations (excluded from measurement)
+    for _ in range(warmup_iterations):
+        _ = flash_attn_func(q, k, v, dropout_p=0.0, causal=causal)
+    
+    # Synchronize before starting actual benchmark
+    torch.cuda.synchronize()
     
     # Benchmark forward pass
     _, m = benchmark_forward(
@@ -88,7 +97,7 @@ def main():
     # Configuration
     device = 'cuda'
     dtype = torch.float16
-    repeats = 30
+    repeats = 50
     
     # Generate sequence lengths: N = 4096 + 4096 * i for i in range(0, 6, 1)
     seqlens = [4096 + 4096 * i for i in range(0, 6, 1)]

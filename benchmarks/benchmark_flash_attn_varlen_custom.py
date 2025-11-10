@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-Custom benchmark script to measure TFLOPS for flash_attn_func forward pass.
+Custom benchmark script to measure TFLOPS for flash_attn_varlen_func forward pass.
 Configuration: (B, H, N, D) = (1, 12, N, 128) where N varies.
+Uses flash_attn_varlen_func which can be more efficient especially with Triton backend.
 """
 
 import math
 import torch
 
 from flash_attn.utils.benchmark import benchmark_forward
-from flash_attn import flash_attn_func
+from flash_attn import flash_attn_varlen_func
 
 
 def flops(batch, seqlen, headdim, nheads, causal, mode="fwd"):
@@ -23,7 +24,7 @@ def efficiency(flop, time):
     return (flop / time / 10**12) if not math.isnan(time) else 0.0
 
 
-def benchmark_flash_attn_fwd(
+def benchmark_flash_attn_varlen_fwd(
     batch_size,
     seqlen,
     nheads,
@@ -35,11 +36,11 @@ def benchmark_flash_attn_fwd(
     warmup_iterations=5
 ):
     """
-    Benchmark flash_attn_func forward pass only.
+    Benchmark flash_attn_varlen_func forward pass only.
     
     Args:
         batch_size: Batch size
-        seqlen: Sequence length
+        seqlen: Sequence length (all sequences have the same length in this benchmark)
         nheads: Number of attention heads
         headdim: Head dimension
         causal: Whether to use causal attention
@@ -52,22 +53,45 @@ def benchmark_flash_attn_fwd(
         time_mean: Mean forward pass time in seconds
         tflops: TFLOPS achieved
     """
-    # Create input tensors
-    q = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
-    k = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
-    v = torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
+    # Create cumulative sequence lengths for varlen interface
+    # For uniform sequences: cu_seqlens = [0, seqlen, 2*seqlen, ..., batch_size*seqlen]
+    cu_seqlens_q = torch.arange(
+        0, (batch_size + 1) * seqlen, step=seqlen, 
+        dtype=torch.int32, device=device
+    )
+    cu_seqlens_k = cu_seqlens_q.clone()
+    
+    # Total sequence length across all batches
+    total_seqlen = batch_size * seqlen
+    
+    # Create packed input tensors (total_seqlen, nheads, headdim)
+    q = torch.randn(total_seqlen, nheads, headdim, device=device, dtype=dtype)
+    k = torch.randn(total_seqlen, nheads, headdim, device=device, dtype=dtype)
+    v = torch.randn(total_seqlen, nheads, headdim, device=device, dtype=dtype)
+    
+    # Maximum sequence length
+    max_seqlen_q = seqlen
+    max_seqlen_k = seqlen
     
     # Warmup iterations (excluded from measurement)
     for _ in range(warmup_iterations):
-        _ = flash_attn_func(q, k, v, dropout_p=0.0, causal=causal)
+        _ = flash_attn_varlen_func(
+            q, k, v,
+            cu_seqlens_q, cu_seqlens_k,
+            max_seqlen_q, max_seqlen_k,
+            dropout_p=0.0,
+            causal=causal
+        )
     
     # Synchronize before starting actual benchmark
     torch.cuda.synchronize()
     
     # Benchmark forward pass
     _, m = benchmark_forward(
-        flash_attn_func,
+        flash_attn_varlen_func,
         q, k, v,
+        cu_seqlens_q, cu_seqlens_k,
+        max_seqlen_q, max_seqlen_k,
         dropout_p=0.0,
         causal=causal,
         repeats=repeats,
@@ -86,7 +110,7 @@ def benchmark_flash_attn_fwd(
 def main():
     """Main benchmark function."""
     print("=" * 80)
-    print("Flash Attention Forward-Only TFLOPS Benchmark (Custom Config)")
+    print("Flash Attention Varlen Forward-Only TFLOPS Benchmark (Custom Config)")
     print("=" * 80)
     
     # Fixed configuration as specified
@@ -111,6 +135,7 @@ def main():
     print(f"Repeats: {repeats}")
     print(f"Configuration: (B, H, N, D) = ({batch_size}, {nheads}, N, {headdim})")
     print(f"Sequence lengths to test: {seqlens}")
+    print(f"Using: flash_attn_varlen_func (optimized for variable-length sequences)")
     print()
     
     # Results storage
@@ -129,7 +154,7 @@ def main():
         
         for seqlen in seqlens:
             try:
-                time_mean, tflops = benchmark_flash_attn_fwd(
+                time_mean, tflops = benchmark_flash_attn_varlen_fwd(
                     batch_size=batch_size,
                     seqlen=seqlen,
                     nheads=nheads,

@@ -147,13 +147,8 @@ ext_modules = []
 # We want this even if SKIP_CUDA_BUILD because when we run python setup.py sdist we want the .hpp
 # files included in the source distribution, in case the user compiles from source.
 if os.path.isdir(".git"):
-    # Only update submodules if the required files don't exist
-    if IS_ROCM and not USE_TRITON_ROCM:
-        if not os.path.exists("csrc/composable_kernel/example/ck_tile/01_fmha/generate.py"):
-            subprocess.run(["git", "submodule", "update", "--init", "csrc/composable_kernel"], check=True)
-    else:
-        if not os.path.exists("csrc/cutlass/include/cutlass/cutlass.h"):
-            subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"], check=True)
+    subprocess.run(["git", "submodule", "update", "--init", "csrc/composable_kernel"], check=True)
+    subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"], check=True)
 else:
     if IS_ROCM:
         if not USE_TRITON_ROCM:

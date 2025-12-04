@@ -195,14 +195,82 @@ def rename_cpp_to_cu(cpp_files):
         shutil.copy(entry, os.path.splitext(entry)[0] + ".cu")
 
 
-def validate_and_update_archs(archs):
-    # List of allowed architectures
-    allowed_archs = ["native", "gfx90a", "gfx950", "gfx942"]
+AMD_ARCH_ALIASES = {
+    "gfx940": "gfx942",
+    "gfx941": "gfx942",
+    "gfx943": "gfx942",
+    "gfx90b": "gfx90a",
+    "gfx90c": "gfx90a",
+    "gfx1200": "gfx1201",
+    "gfx1202": "gfx1201",
+    "gfx1203": "gfx1201",
+}
 
-    # Validate if each element in archs is in allowed_archs
-    assert all(
-        arch in allowed_archs for arch in archs
-    ), f"One of GPU archs of {archs} is invalid or not supported by Flash-Attention"
+
+def normalize_amd_arch(arch: str) -> str:
+    arch_norm = arch.strip().lower()
+    return AMD_ARCH_ALIASES.get(arch_norm, arch_norm)
+
+
+def validate_and_update_archs(archs):
+    allowed_archs = {"native", "gfx90a", "gfx942", "gfx950", "gfx1201"}
+    normalized = []
+    for arch in archs:
+        arch_norm = arch.strip().lower()
+        if not arch_norm:
+            continue
+        if arch_norm == "native":
+            normalized.append("native")
+            continue
+        mapped = normalize_amd_arch(arch_norm)
+        if mapped not in allowed_archs:
+            raise AssertionError(
+                f"One of GPU archs of {archs} is invalid or not supported by Flash-Attention"
+            )
+        normalized.append(mapped)
+    return normalized or ["native"]
+
+
+def detect_amd_arch():
+    try:
+        result = subprocess.run(
+            ["rocminfo"], capture_output=True, text=True, check=True
+        )
+        match = re.search(r"Name:\s+(gfx\d+)", result.stdout)
+        if match:
+            raw_arch = match.group(1).lower()
+            normalized = normalize_amd_arch(raw_arch)
+            if normalized != raw_arch:
+                print(
+                    f"Auto-detected GPU architecture: {raw_arch}, using kernel target: {normalized}"
+                )
+            else:
+                print(f"Auto-detected GPU architecture: {raw_arch}")
+            return normalized
+    except (subprocess.SubprocessError, FileNotFoundError):
+        pass
+
+    try:
+        if torch.cuda.is_available():
+            raw_arch = (
+                torch.cuda.get_device_properties("cuda")
+                .gcnArchName.split(":")[0]
+                .lower()
+            )
+            if raw_arch:
+                normalized = normalize_amd_arch(raw_arch)
+                if normalized != raw_arch:
+                    print(
+                        f"Auto-detected GPU architecture via torch: {raw_arch}, using kernel target: {normalized}"
+                    )
+                else:
+                    print(f"Auto-detected GPU architecture via torch: {raw_arch}")
+                return normalized
+    except Exception:
+        pass
+
+    print("Warning: Could not detect GPU architecture, defaulting to gfx90a")
+    return "gfx90a"
 
 
 cmdclass = {}
@@ -382,10 +450,94 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
             os.makedirs("build")
 
         optdim = os.getenv("OPT_DIM", "32,64,128,256")
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd_appendkv", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd_splitkv", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "bwd", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
+
+        check_if_rocm_home_none("flash_attn")
+        arch_tokens = [
+            token.strip()
+            for token in os.getenv("GPU_ARCHS", "native").split(";")
+            if token.strip()
+        ]
+        if len(arch_tokens) > 1:
+            arch_tokens = [token for token in arch_tokens if token.lower() != "native"]
+        archs = validate_and_update_archs(arch_tokens or ["native"])
+        if archs == ["native"]:
+            detected_arch = detect_amd_arch()
+            archs = [detected_arch]
+        else:
+            print(f"Using GPU_ARCHS={';'.join(archs)}")
+
+        kernel_targets = list(dict.fromkeys(archs))
+        targets_arg = ",".join(kernel_targets)
+        cc_flag = [f"--offload-arch={arch}" for arch in kernel_targets]
+
+        subprocess.run(
+            [
+                sys.executable,
+                f"{ck_dir}/example/ck_tile/01_fmha/generate.py",
+                "-d",
+                "fwd",
+                "--output_dir",
+                "build",
+                "--receipt",
+                "2",
+                "--optdim",
+                optdim,
+                "--targets",
+                targets_arg,
+            ],
+            check=True,
+        )
+        subprocess.run(
+            [
+                sys.executable,
+                f"{ck_dir}/example/ck_tile/01_fmha/generate.py",
+                "-d",
+                "fwd_appendkv",
+                "--output_dir",
+                "build",
+                "--receipt",
+                "2",
+                "--optdim",
+                optdim,
+                "--targets",
+                targets_arg,
+            ],
+            check=True,
+        )
+        subprocess.run(
+            [
+                sys.executable,
+                f"{ck_dir}/example/ck_tile/01_fmha/generate.py",
+                "-d",
+                "fwd_splitkv",
+                "--output_dir",
+                "build",
+                "--receipt",
+                "2",
+                "--optdim",
+                optdim,
+                "--targets",
+                targets_arg,
+            ],
+            check=True,
+        )
+        subprocess.run(
+            [
+                sys.executable,
+                f"{ck_dir}/example/ck_tile/01_fmha/generate.py",
+                "-d",
+                "bwd",
+                "--output_dir",
+                "build",
+                "--receipt",
+                "2",
+                "--optdim",
+                optdim,
+                "--targets",
+                targets_arg,
+            ],
+            check=True,
+        )
 
         # Check, if ATen/CUDAGeneratorImpl.h is found, otherwise use ATen/cuda/CUDAGeneratorImpl.h
         # See https://github.com/pytorch/pytorch/pull/70650
@@ -394,15 +546,7 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
         if os.path.exists(os.path.join(torch_dir, "include", "ATen", "CUDAGeneratorImpl.h")):
             generator_flag = ["-DOLD_GENERATOR_PATH"]
 
-        check_if_rocm_home_none("flash_attn")
-        archs = os.getenv("GPU_ARCHS", "native").split(";")
-        validate_and_update_archs(archs)
-
-        if archs != ['native']:
-            cc_flag = [f"--offload-arch={arch}" for arch in archs]
-        else:
-            arch = torch.cuda.get_device_properties("cuda").gcnArchName.split(":")[0]
-            cc_flag = [f"--offload-arch={arch}"]
+        # cc_flag already initialized with --offload-arch entries above
 
         # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
         # torch._C._GLIBCXX_USE_CXX11_ABI

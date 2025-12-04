@@ -121,7 +121,10 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                          out.data_ptr(),
                          seqlens_q.data_ptr(), // seqstart_q
                          seqlens_k.data_ptr(), // seqstart_k
-                         nullptr,              // seqlen_kpads
+                         nullptr,              // seqlen_q_ptr
+                         nullptr,              // seqlen_k_ptr
+                         nullptr,              // cu_seqlen_q_ptr
+                         nullptr,              // cu_seqlen_k_ptr
                          total_q,
                          total_k,
                          b,
@@ -131,8 +134,8 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                          h,             // nhead
                          h_k,           // nhead_k
                          softmax_scale, // scale_s
-                         1,             // scale_p
-                         1,             // scale_o
+                         1.0f,          // scale_p
+                         1.0f,          // scale_o
                          0.0f,          // logits_soft_cap
                          stride_q,
                          stride_k,
@@ -237,8 +240,8 @@ fmha_fwd_splitkv_args get_ck_fmha_varlen_fwd_splitkv_args(bool has_lse,
     args.num_splits = num_splits;
 
     args.scale_s = softmax_scale;
-    args.scale_p = 1;
-    args.scale_o = 1;
+    args.scale_p = 1.0f;
+    args.scale_o = 1.0f;
 
     args.batch_stride_q = 0;
     args.stride_q = q.stride(0);

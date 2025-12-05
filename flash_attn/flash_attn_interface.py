@@ -50,6 +50,22 @@ def round_multiple(x, m):
     return (x + m - 1) // m * m
 
 
+def _get_uniform_seqlen(cu_seqlens: torch.Tensor) -> Optional[int]:
+    if cu_seqlens is None or cu_seqlens.numel() < 2:
+        return None
+    diffs = cu_seqlens[1:] - cu_seqlens[:-1]
+    diffs = diffs.detach()
+    if diffs.is_cuda:
+        diffs = diffs.cpu()
+    diffs = diffs.to(torch.int64)
+    first = int(diffs[0].item())
+    if first <= 0:
+        return None
+    if torch.all(diffs == first):
+        return first
+    return None
+
+
 # torch.compile() support is only enabled for pytorch >= 2.4
 # The reason for this is that we are using the new custom_op and register_fake
 # APIs, which support inplace modification of inputs in the function itself
@@ -932,28 +948,90 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
-        out_padded, softmax_lse, S_dmask, rng_state = _wrapped_flash_attn_varlen_forward(
-            q,
-            k,
-            v,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            dropout_p,
-            softmax_scale,
-            causal=causal,
-            window_size_left=window_size[0],
-            window_size_right=window_size[1],
-            softcap=softcap,
-            alibi_slopes=alibi_slopes,
-            return_softmax=return_softmax and dropout_p > 0,
-            block_table=block_table,
+        batch_size = cu_seqlens_q.numel() - 1
+        uniform_q = _get_uniform_seqlen(cu_seqlens_q)
+        uniform_k = _get_uniform_seqlen(cu_seqlens_k)
+        can_use_dense = (
+            block_table is None
+            and uniform_q is not None
+            and uniform_k is not None
+            and uniform_q == uniform_k
+            and max_seqlen_q == uniform_q
+            and max_seqlen_k == uniform_k
+            and q.shape[0] == batch_size * uniform_q
+            and k.shape[0] == batch_size * uniform_k
+            and v.shape[0] == batch_size * uniform_k
         )
-        if is_grad:
-            ctx.save_for_backward(
-                q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state
+        ctx.use_dense_path = bool(can_use_dense)
+        saved_tensors = ()
+        if ctx.use_dense_path:
+            q_dense = q.reshape(batch_size, uniform_q, q.shape[1], q.shape[2])
+            k_dense = k.reshape(batch_size, uniform_k, k.shape[1], k.shape[2])
+            v_dense = v.reshape(batch_size, uniform_k, v.shape[1], v.shape[2])
+            out_dense, softmax_lse_dense, S_dmask, rng_state = _wrapped_flash_attn_forward(
+                q_dense,
+                k_dense,
+                v_dense,
+                dropout_p,
+                softmax_scale,
+                causal=causal,
+                window_size_left=window_size[0],
+                window_size_right=window_size[1],
+                softcap=softcap,
+                alibi_slopes=alibi_slopes,
+                return_softmax=return_softmax and dropout_p > 0,
             )
+            out_padded = out_dense.reshape(-1, out_dense.size(2), out_dense.size(3))
+            softmax_lse = (
+                softmax_lse_dense.permute(1, 0, 2)
+                .reshape(softmax_lse_dense.size(1), -1)
+                .contiguous()
+            )
+            saved_tensors = (
+                q_dense,
+                k_dense,
+                v_dense,
+                out_dense,
+                softmax_lse_dense,
+                rng_state,
+            )
+            ctx.batch_size = batch_size
+            ctx.seqlen_q = uniform_q
+            ctx.seqlen_k = uniform_k
+        else:
+            out_padded, softmax_lse, S_dmask, rng_state = _wrapped_flash_attn_varlen_forward(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                dropout_p,
+                softmax_scale,
+                causal=causal,
+                window_size_left=window_size[0],
+                window_size_right=window_size[1],
+                softcap=softcap,
+                alibi_slopes=alibi_slopes,
+                return_softmax=return_softmax and dropout_p > 0,
+                block_table=block_table,
+            )
+            saved_tensors = (
+                q,
+                k,
+                v,
+                out_padded,
+                softmax_lse,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                rng_state,
+            )
+            ctx.batch_size = None
+            ctx.seqlen_q = None
+            ctx.seqlen_k = None
+        if is_grad:
+            ctx.save_for_backward(*saved_tensors)
             ctx.dropout_p = dropout_p
             ctx.max_seqlen_q = max_seqlen_q
             ctx.max_seqlen_k = max_seqlen_k
@@ -969,6 +1047,43 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
+        if getattr(ctx, "use_dense_path", False):
+            q, k, v, out, softmax_lse, rng_state = ctx.saved_tensors
+            dq_dense = torch.empty_like(q)
+            dk_dense = torch.empty_like(k)
+            dv_dense = torch.empty_like(v)
+            head_size_og = dout.size(2)
+            dout_dense = dout.reshape(ctx.batch_size, ctx.seqlen_q, dout.size(1), head_size_og)
+            dout_padded = dout_dense
+            if head_size_og % 8 != 0:
+                dout_padded = torch.nn.functional.pad(dout_dense, [0, 8 - head_size_og % 8])
+            _wrapped_flash_attn_backward(
+                dout_padded,
+                q,
+                k,
+                v,
+                out,
+                softmax_lse,
+                dq_dense,
+                dk_dense,
+                dv_dense,
+                ctx.dropout_p,
+                ctx.softmax_scale,
+                ctx.causal,
+                ctx.window_size[0],
+                ctx.window_size[1],
+                ctx.softcap,
+                ctx.alibi_slopes,
+                ctx.deterministic,
+                rng_state=rng_state,
+            )
+            dq_dense = dq_dense[..., : dout.shape[-1]]
+            dk_dense = dk_dense[..., : dout.shape[-1]]
+            dv_dense = dv_dense[..., : dout.shape[-1]]
+            dq = dq_dense.reshape(-1, dq_dense.size(2), dq_dense.size(3))
+            dk = dk_dense.reshape(-1, dk_dense.size(2), dk_dense.size(3))
+            dv = dv_dense.reshape(-1, dv_dense.size(2), dv_dense.size(3))
+            return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None
         q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state = ctx.saved_tensors
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
         head_size_og = dout.size(2)
@@ -999,7 +1114,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.deterministic,
             rng_state=rng_state,
         )
-        dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
+        dq = dq[..., : dout.shape[-1]]
         dk = dk[..., : dout.shape[-1]]
         dv = dv[..., : dout.shape[-1]]
         return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None

@@ -333,10 +333,17 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
     at::cuda::CUDAGuard device_guard{q.device()};
 
     auto opts = q.options();
+#ifdef HIPIFY_V2
+    // gfx12 deterministic bwd is unstable; always fall back to nondeterministic there.
+    bool deterministic_safe = deterministic && !flash::is_gfx12_arch();
+#else
+    bool deterministic_safe = deterministic;
+#endif
     auto softmax_d = torch::empty({batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
+    softmax_d.zero_();
     at::Tensor dq_accum;
 
-    if (!deterministic) {
+    if (!deterministic_safe) {
         dq_accum = torch::zeros({1, total_q, num_heads, head_size}, opts.dtype(at::kFloat));
     } else {
         const ck_tile::index_t kN0 = head_size <= 128 ? 128 : 64;
@@ -377,7 +384,7 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
             flash::ParsePhiloxCudaState, dim3(1), dim3(64), 0, 0,
             philox_args, reinterpret_cast<uint64_t*>(rng_state.data_ptr()));
     } else {
-        rng_state = torch::empty({2}, opts.dtype(torch::kInt64));
+        rng_state = torch::zeros({2}, opts.dtype(torch::kInt64));
     }
 
     if (max_seqlen_q > 0) {

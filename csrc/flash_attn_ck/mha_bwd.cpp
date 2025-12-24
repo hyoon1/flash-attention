@@ -319,10 +319,22 @@ mha_bwd(const at::Tensor &dout,                   // batch_size x seqlen_q x num
     at::cuda::CUDAGuard device_guard{q.device()};
 
     auto opts = q.options();
+#ifdef HIPIFY_V2
+    // gfx12 deterministic bwd is unstable; always fall back to nondeterministic there.
+    bool deterministic_safe = deterministic && !flash::is_gfx12_arch();
+#else
+    bool deterministic_safe = deterministic;
+#endif
+    // CK bwd kernels may leave portions of the outputs untouched; zero to avoid stale data.
+    dq.zero_();
+    dk.zero_();
+    dv.zero_();
     auto softmax_d = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
+    // Some CK kernels only partially write this buffer; zero to avoid stale data.
+    softmax_d.zero_();
     at::Tensor dq_accum;
 
-    if (!deterministic) {
+    if (!deterministic_safe) {
         dq_accum = torch::zeros({1, batch_size, seqlen_q, num_heads, head_size}, opts.dtype(at::kFloat));
     } else {
         const ck_tile::index_t kN0 = head_size <= 128 ? 128 : 64;
@@ -355,6 +367,9 @@ mha_bwd(const at::Tensor &dout,                   // batch_size x seqlen_q x num
         hipLaunchKernelGGL(
             flash::ParsePhiloxCudaState, dim3(1), dim3(64), 0, 0,
             philox_args, reinterpret_cast<uint64_t*>(rng_state.data_ptr()));
+    } else {
+        // Keep seed/offset deterministic even when dropout is disabled.
+        rng_state = torch::zeros({2}, opts.dtype(torch::kInt64));
     }
 
     if (seqlen_q > 0) {
@@ -363,7 +378,7 @@ mha_bwd(const at::Tensor &dout,                   // batch_size x seqlen_q x num
         ck_tile::stream_config stream_config{stream};
 
         auto traits =
-            get_ck_fmha_bwd_traits(mask, q_dtype_str, head_size, is_dropout, alibi_slopes_.has_value(), deterministic);
+            get_ck_fmha_bwd_traits(mask, q_dtype_str, head_size, is_dropout, alibi_slopes_.has_value(), deterministic_safe);
 
         auto args =
             get_ck_fmha_bwd_args(

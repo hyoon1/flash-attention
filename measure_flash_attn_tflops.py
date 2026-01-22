@@ -177,7 +177,10 @@ def maybe_plot(results, out_path):
     for r in results:
         if r["TFLOPS"] is None:
             continue
-        key = f"{r['backend']}-{r['mode']}"
+        if r["mode"] == "sdpa":
+            key = "sdpa-aotriton"
+        else:
+            key = f"{r['backend']}-{r['mode']}"
         series.setdefault(key, []).append(r)
     plt.figure(figsize=(6, 4))
     markers = ["o", "s", "^", "x", "d"]

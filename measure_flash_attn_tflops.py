@@ -92,9 +92,22 @@ def run_sdpa(seqlen_q, seqlen_k, batch, nheads, head_dim, dtype, causal):
     return start.elapsed_time(end) / 1000.0  # seconds
 
 
+def format_config_label(args):
+    causal = "causal" if args.causal else "noncausal"
+    return f"B{args.batch} H{args.nheads} d{args.head_dim} {args.dtype} {causal}"
+
+
 def benchmark(args, fa_mod, backend_label, include_sdpa=False):
     lengths = make_lengths(args.min_len, args.max_len, args.step)
-    print(f"Backend={backend_label}  Lengths={lengths}")
+    config_label = format_config_label(args)
+    meta = {
+        "batch": args.batch,
+        "nheads": args.nheads,
+        "head_dim": args.head_dim,
+        "dtype": args.dtype,
+        "causal": args.causal,
+    }
+    print(f"Backend={backend_label}  Lengths={lengths}  Config={config_label}")
     results = []
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
     for mode, runner in (("dense", run_once), ("varlen", run_once_varlen)):
@@ -110,7 +123,9 @@ def benchmark(args, fa_mod, backend_label, include_sdpa=False):
                     times = None
                     break
             if times is None:
-                results.append({"backend": backend_label, "mode": mode, "L": l, "time_s": None, "TFLOPS": None})
+                result = {"backend": backend_label, "mode": mode, "L": l, "time_s": None, "TFLOPS": None}
+                result.update(meta)
+                results.append(result)
                 continue
             for _ in range(args.repeat):
                 try:
@@ -122,12 +137,16 @@ def benchmark(args, fa_mod, backend_label, include_sdpa=False):
                     times = None
                     break
             if not times:
-                results.append({"backend": backend_label, "mode": mode, "L": l, "time_s": None, "TFLOPS": None})
+                result = {"backend": backend_label, "mode": mode, "L": l, "time_s": None, "TFLOPS": None}
+                result.update(meta)
+                results.append(result)
                 continue
             avg_s = sum(times) / len(times)
             flops = estimate_flops(args.batch, args.nheads, l, l, args.head_dim)
             tflops = flops / avg_s / 1e12
-            results.append({"backend": backend_label, "mode": mode, "L": l, "time_s": avg_s, "TFLOPS": tflops})
+            result = {"backend": backend_label, "mode": mode, "L": l, "time_s": avg_s, "TFLOPS": tflops}
+            result.update(meta)
+            results.append(result)
             print(f"L={l:6d}  {mode:6s}  time={avg_s*1e3:7.2f} ms  TFLOPS={tflops:6.2f}")
     if include_sdpa:
         print(f"--- sdpa (aotriton) ---")
@@ -143,7 +162,9 @@ def benchmark(args, fa_mod, backend_label, include_sdpa=False):
                     times = None
                     break
             if times is None:
-                results.append({"backend": sdpa_backend, "mode": "sdpa", "L": l, "time_s": None, "TFLOPS": None})
+                result = {"backend": sdpa_backend, "mode": "sdpa", "L": l, "time_s": None, "TFLOPS": None}
+                result.update(meta)
+                results.append(result)
                 continue
             for _ in range(args.repeat):
                 try:
@@ -155,17 +176,21 @@ def benchmark(args, fa_mod, backend_label, include_sdpa=False):
                     times = None
                     break
             if not times:
-                results.append({"backend": sdpa_backend, "mode": "sdpa", "L": l, "time_s": None, "TFLOPS": None})
+                result = {"backend": sdpa_backend, "mode": "sdpa", "L": l, "time_s": None, "TFLOPS": None}
+                result.update(meta)
+                results.append(result)
                 continue
             avg_s = sum(times) / len(times)
             flops = estimate_flops(args.batch, args.nheads, l, l, args.head_dim)
             tflops = flops / avg_s / 1e12
-            results.append({"backend": sdpa_backend, "mode": "sdpa", "L": l, "time_s": avg_s, "TFLOPS": tflops})
+            result = {"backend": sdpa_backend, "mode": "sdpa", "L": l, "time_s": avg_s, "TFLOPS": tflops}
+            result.update(meta)
+            results.append(result)
             print(f"L={l:6d}  sdpa   time={avg_s*1e3:7.2f} ms  TFLOPS={tflops:6.2f}")
     return results
 
 
-def maybe_plot(results, out_path):
+def maybe_plot(results, out_path, config_label):
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -182,18 +207,25 @@ def maybe_plot(results, out_path):
         else:
             key = f"{r['backend']}-{r['mode']}"
         series.setdefault(key, []).append(r)
-    plt.figure(figsize=(6, 4))
+    fig, ax = plt.subplots(figsize=(6, 4))
     markers = ["o", "s", "^", "x", "d"]
     for idx, (key, vals) in enumerate(series.items()):
         vals_sorted = sorted(vals, key=lambda x: x["L"])
-        plt.plot([r["L"] for r in vals_sorted], [r["TFLOPS"] for r in vals_sorted], marker=markers[idx % len(markers)], label=key)
-    plt.xlabel("Sequence length (Lq=Lk)")
-    plt.ylabel("TFLOPS (approx)")
-    plt.title("FlashAttention forward TFLOPS vs length")
-    plt.grid(True)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(out_path)
+        ax.plot(
+            [r["L"] for r in vals_sorted],
+            [r["TFLOPS"] for r in vals_sorted],
+            marker=markers[idx % len(markers)],
+            label=key,
+        )
+    ax.set_xlabel("Sequence length (Lq=Lk)")
+    ax.set_ylabel("TFLOPS (approx)")
+    ax.set_title("FlashAttention forward TFLOPS vs length")
+    ax.grid(True)
+    ax.legend()
+    # Stamp run parameters on the figure so plots stay self-describing when shared.
+    fig.text(0.5, 0.02, f"Config: {config_label}", ha="center", fontsize=9)
+    fig.tight_layout(rect=[0, 0.04, 1, 1])
+    fig.savefig(out_path)
     print(f"Wrote plot to {out_path}")
 
 
@@ -234,6 +266,8 @@ if __name__ == "__main__":
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     print(f"Running on {torch.cuda.get_device_name()}")
+    config_label = format_config_label(args)
+    print(f"Run config: {config_label}")
 
     backend_plan = []
     if args.backend == "both":
@@ -252,4 +286,4 @@ if __name__ == "__main__":
         all_results.extend(benchmark(args, fa_mod, label, include_sdpa=args.sdpa and label == backend_plan[0][0]))
 
     if args.plot:
-        maybe_plot(all_results, args.plot_path)
+        maybe_plot(all_results, args.plot_path, config_label)

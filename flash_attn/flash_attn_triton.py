@@ -1121,6 +1121,9 @@ class FlashAttnFunc(torch.autograd.Function):
             For example, ALiBi mask for causal would have shape (1, nheads, 1, seqlen_k).
             ALiBi mask for non-causal would have shape (1, nheads, seqlen_q, seqlen_k)
         """
+        if not hasattr(ctx, "_dense_notice"):
+            print("[flash-attn] FlashAttnFunc (dense, non-varlen) forward invoked")
+            setattr(ctx, "_dense_notice", True)
         # Make sure that the last dimension is contiguous
         q, k, v = [x if x.stride(-1) == 1 else x.contiguous() for x in [q, k, v]]
         o, lse, ctx.softmax_scale = _flash_attn_forward(

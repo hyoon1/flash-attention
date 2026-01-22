@@ -838,6 +838,10 @@ class FlashAttnFunc(torch.autograd.Function):
         return_softmax,
         is_grad_enabled,
     ):
+        # One-time notice when the dense (non-varlen) FlashAttention path runs (CK backend).
+        if not hasattr(FlashAttnFunc, "_dense_notice"):
+            print("[flash-attn] FlashAttnFunc forward invoked (dense / non-varlen)")
+            FlashAttnFunc._dense_notice = True
         is_grad = is_grad_enabled and any(
             x.requires_grad for x in [q, k, v]
         )

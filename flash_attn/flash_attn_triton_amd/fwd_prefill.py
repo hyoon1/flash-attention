@@ -1,8 +1,72 @@
+import json
+import os
+from pathlib import Path
 import torch
 import triton
 import triton.language as tl
 from typing import Literal, Optional, Union
 from .utils import DEBUG, DROPOUT_USE_PYTORCH, DROPOUT_DUMP, AUTOTUNE, compute_alibi_block, compute_fp8_scaling_factors, get_shapes_from_layout, get_strides_from_layout, is_cdna, is_fp8, is_rdna, create_dropout_mask
+
+_FLASH_ATTN_LOG_PATH = Path(
+    os.environ.get("FLASH_ATTN_LOG_PATH", Path.cwd() / "flash_attn_calls.log")
+)
+_LOGGED_CALL_KEYS = set()
+_ENTRY_PRINTED = False
+
+
+def _summarize_cu_seqlens(cu_seqlens: Optional[torch.Tensor]):
+    if cu_seqlens is None:
+        return None
+    try:
+        cpu = cu_seqlens.detach().cpu()
+        numel = int(cpu.numel())
+        summary = {"numel": numel}
+        if numel > 0:
+            summary["first"] = int(cpu[0].item())
+            summary["last"] = int(cpu[-1].item())
+            summary["head"] = [int(x) for x in cpu[: min(4, numel)].tolist()]
+            if numel > 8:
+                summary["tail"] = [int(x) for x in cpu[-4:].tolist()]
+        return summary
+    except Exception as exc:  # pragma: no cover
+        return {"error": str(exc)}
+
+
+def _log_flash_attn_prefill(payload: dict):
+    payload = dict(payload)
+    key = (
+        payload.get("layout"),
+        payload.get("causal"),
+        payload.get("is_varlen"),
+        payload.get("is_inference"),
+        payload.get("batch"),
+        payload.get("nheads_q"),
+        payload.get("nheads_k"),
+        payload.get("head_size"),
+        payload.get("seqlen_q"),
+        payload.get("seqlen_k"),
+        payload.get("max_seqlens_q"),
+        payload.get("max_seqlens_k"),
+        payload.get("dropout_p"),
+        payload.get("return_softmax"),
+        payload.get("use_exp2"),
+        payload.get("use_alibi"),
+        payload.get("dtype"),
+        payload.get("device"),
+        json.dumps(payload.get("cu_seqlens_q"), sort_keys=True),
+        json.dumps(payload.get("cu_seqlens_k"), sort_keys=True),
+    )
+    if key in _LOGGED_CALL_KEYS:
+        return
+    _LOGGED_CALL_KEYS.add(key)
+    try:
+        _FLASH_ATTN_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(payload, default=str)
+        with _FLASH_ATTN_LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+        print(f"[flash-attn-log] wrote {_FLASH_ATTN_LOG_PATH}: {line}")
+    except Exception:
+        pass
 
 # NOTE: triton fails to import tl.constexprs so create them here for the file
 tl_DROPOUT_USE_PYTORCH: tl.constexpr = triton.language.constexpr(DROPOUT_USE_PYTORCH)
@@ -553,6 +617,10 @@ def attention_prefill_forward_triton_impl(
                                         descale_v: Optional[torch.Tensor],
                                         descale_o: Optional[torch.Tensor],
 ):
+    global _ENTRY_PRINTED
+    if not _ENTRY_PRINTED:
+        print(f"[flash-attn-log] attention_prefill_forward_triton_impl entered; logging to {_FLASH_ATTN_LOG_PATH.resolve()}")
+        _ENTRY_PRINTED = True
     IS_FP8 = is_fp8(q)
     if IS_FP8:
         FP8_MAX: tl.constexpr = torch.finfo(q.dtype).max
@@ -591,6 +659,30 @@ def attention_prefill_forward_triton_impl(
 
     batch, nheads_q, nheads_k, head_size, seqlen_q, seqlen_k = get_shapes_from_layout(q, k, layout, cu_seqlens_q, cu_seqlens_k, max_seqlens_q, max_seqlens_k)
     q_strides, k_strides, v_strides, o_strides = get_strides_from_layout(q, k, v, o, layout)
+
+    log_payload = {
+        "layout": layout,
+        "causal": bool(causal),
+        "is_varlen": bool(is_varlen),
+        "is_inference": bool(is_inference),
+        "batch": int(batch),
+        "nheads_q": int(nheads_q),
+        "nheads_k": int(nheads_k),
+        "head_size": int(head_size),
+        "seqlen_q": int(seqlen_q),
+        "seqlen_k": int(seqlen_k),
+        "max_seqlens_q": int(max_seqlens_q),
+        "max_seqlens_k": int(max_seqlens_k),
+        "dropout_p": float(dropout_p),
+        "return_softmax": bool(return_softmax),
+        "use_exp2": bool(use_exp2),
+        "use_alibi": bool(use_alibi),
+        "dtype": str(q.dtype),
+        "device": str(q.device),
+        "cu_seqlens_q": _summarize_cu_seqlens(cu_seqlens_q),
+        "cu_seqlens_k": _summarize_cu_seqlens(cu_seqlens_k),
+    }
+    _log_flash_attn_prefill(log_payload)
 
     # Get closest power of 2 over or equal to 32.
     padded_d_model = 1 << (head_size - 1).bit_length()

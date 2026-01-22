@@ -10,6 +10,7 @@ from .utils import DEBUG, DROPOUT_USE_PYTORCH, DROPOUT_DUMP, AUTOTUNE, compute_a
 _FLASH_ATTN_LOG_PATH = Path(
     os.environ.get("FLASH_ATTN_LOG_PATH", Path.cwd() / "flash_attn_calls.log")
 )
+_FLASH_ATTN_LOG_ENABLED = os.environ.get("FLASH_ATTN_LOG_DISABLE", "0").lower() not in ("1", "true", "yes")
 _LOGGED_CALL_KEYS = set()
 _ENTRY_PRINTED = False
 
@@ -33,6 +34,8 @@ def _summarize_cu_seqlens(cu_seqlens: Optional[torch.Tensor]):
 
 
 def _log_flash_attn_prefill(payload: dict):
+    if not _FLASH_ATTN_LOG_ENABLED:
+        return
     payload = dict(payload)
     key = (
         payload.get("layout"),
@@ -618,7 +621,7 @@ def attention_prefill_forward_triton_impl(
                                         descale_o: Optional[torch.Tensor],
 ):
     global _ENTRY_PRINTED
-    if not _ENTRY_PRINTED:
+    if _FLASH_ATTN_LOG_ENABLED and not _ENTRY_PRINTED:
         print(f"[flash-attn-log] attention_prefill_forward_triton_impl entered; logging to {_FLASH_ATTN_LOG_PATH.resolve()}")
         _ENTRY_PRINTED = True
     IS_FP8 = is_fp8(q)
@@ -660,29 +663,30 @@ def attention_prefill_forward_triton_impl(
     batch, nheads_q, nheads_k, head_size, seqlen_q, seqlen_k = get_shapes_from_layout(q, k, layout, cu_seqlens_q, cu_seqlens_k, max_seqlens_q, max_seqlens_k)
     q_strides, k_strides, v_strides, o_strides = get_strides_from_layout(q, k, v, o, layout)
 
-    log_payload = {
-        "layout": layout,
-        "causal": bool(causal),
-        "is_varlen": bool(is_varlen),
-        "is_inference": bool(is_inference),
-        "batch": int(batch),
-        "nheads_q": int(nheads_q),
-        "nheads_k": int(nheads_k),
-        "head_size": int(head_size),
-        "seqlen_q": int(seqlen_q),
-        "seqlen_k": int(seqlen_k),
-        "max_seqlens_q": int(max_seqlens_q),
-        "max_seqlens_k": int(max_seqlens_k),
-        "dropout_p": float(dropout_p),
-        "return_softmax": bool(return_softmax),
-        "use_exp2": bool(use_exp2),
-        "use_alibi": bool(use_alibi),
-        "dtype": str(q.dtype),
-        "device": str(q.device),
-        "cu_seqlens_q": _summarize_cu_seqlens(cu_seqlens_q),
-        "cu_seqlens_k": _summarize_cu_seqlens(cu_seqlens_k),
-    }
-    _log_flash_attn_prefill(log_payload)
+    if _FLASH_ATTN_LOG_ENABLED:
+        log_payload = {
+            "layout": layout,
+            "causal": bool(causal),
+            "is_varlen": bool(is_varlen),
+            "is_inference": bool(is_inference),
+            "batch": int(batch),
+            "nheads_q": int(nheads_q),
+            "nheads_k": int(nheads_k),
+            "head_size": int(head_size),
+            "seqlen_q": int(seqlen_q),
+            "seqlen_k": int(seqlen_k),
+            "max_seqlens_q": int(max_seqlens_q),
+            "max_seqlens_k": int(max_seqlens_k),
+            "dropout_p": float(dropout_p),
+            "return_softmax": bool(return_softmax),
+            "use_exp2": bool(use_exp2),
+            "use_alibi": bool(use_alibi),
+            "dtype": str(q.dtype),
+            "device": str(q.device),
+            "cu_seqlens_q": _summarize_cu_seqlens(cu_seqlens_q),
+            "cu_seqlens_k": _summarize_cu_seqlens(cu_seqlens_k),
+        }
+        _log_flash_attn_prefill(log_payload)
 
     # Get closest power of 2 over or equal to 32.
     padded_d_model = 1 << (head_size - 1).bit_length()

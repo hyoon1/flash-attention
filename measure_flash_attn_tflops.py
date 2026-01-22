@@ -77,7 +77,22 @@ def make_lengths(min_len, max_len, step):
     return sorted(vals)
 
 
-def benchmark(args, fa_mod, backend_label):
+def run_sdpa(seqlen_q, seqlen_k, batch, nheads, head_dim, dtype, causal):
+    device = "cuda"
+    q = torch.randn(batch, nheads, seqlen_q, head_dim, device=device, dtype=dtype)
+    k = torch.randn(batch, nheads, seqlen_k, head_dim, device=device, dtype=dtype)
+    v = torch.randn(batch, nheads, seqlen_k, head_dim, device=device, dtype=dtype)
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=causal)
+    end.record()
+    end.synchronize()
+    return start.elapsed_time(end) / 1000.0  # seconds
+
+
+def benchmark(args, fa_mod, backend_label, include_sdpa=False):
     lengths = make_lengths(args.min_len, args.max_len, args.step)
     print(f"Backend={backend_label}  Lengths={lengths}")
     results = []
@@ -114,6 +129,39 @@ def benchmark(args, fa_mod, backend_label):
             tflops = flops / avg_s / 1e12
             results.append({"backend": backend_label, "mode": mode, "L": l, "time_s": avg_s, "TFLOPS": tflops})
             print(f"L={l:6d}  {mode:6s}  time={avg_s*1e3:7.2f} ms  TFLOPS={tflops:6.2f}")
+    if include_sdpa:
+        print(f"--- sdpa (aotriton) ---")
+        sdpa_backend = "sdpa-aotriton"
+        for l in lengths:
+            times = []
+            for _ in range(args.burn_in):
+                try:
+                    run_sdpa(l, l, args.batch, args.nheads, args.head_dim, dtype, args.causal)
+                except RuntimeError as e:
+                    print(f"L={l} sdpa: burn-in failed ({e}); skipping this length")
+                    torch.cuda.empty_cache()
+                    times = None
+                    break
+            if times is None:
+                results.append({"backend": sdpa_backend, "mode": "sdpa", "L": l, "time_s": None, "TFLOPS": None})
+                continue
+            for _ in range(args.repeat):
+                try:
+                    t = run_sdpa(l, l, args.batch, args.nheads, args.head_dim, dtype, args.causal)
+                    times.append(t)
+                except RuntimeError as e:
+                    print(f"L={l} sdpa: run failed ({e}); skipping remaining repeats")
+                    torch.cuda.empty_cache()
+                    times = None
+                    break
+            if not times:
+                results.append({"backend": sdpa_backend, "mode": "sdpa", "L": l, "time_s": None, "TFLOPS": None})
+                continue
+            avg_s = sum(times) / len(times)
+            flops = estimate_flops(args.batch, args.nheads, l, l, args.head_dim)
+            tflops = flops / avg_s / 1e12
+            results.append({"backend": sdpa_backend, "mode": "sdpa", "L": l, "time_s": avg_s, "TFLOPS": tflops})
+            print(f"L={l:6d}  sdpa   time={avg_s*1e3:7.2f} ms  TFLOPS={tflops:6.2f}")
     return results
 
 
@@ -161,6 +209,7 @@ def parse_args():
     p.add_argument("--plot", action="store_true", help="Save matplotlib plot to PNG")
     p.add_argument("--plot-path", type=Path, default=Path("flash_attn_tflops.png"), help="Plot output path")
     p.add_argument("--backend", choices=["env", "ck", "triton", "both"], default="both", help="Backend sweep: use current env, force CK (env var FALSE), force Triton AMD (env var TRUE), or run both sequentially")
+    p.add_argument("--sdpa", action="store_true", help="Also measure torch.sdpa for comparison")
     return p.parse_args()
 
 
@@ -197,7 +246,7 @@ if __name__ == "__main__":
     all_results = []
     for label, enable_triton in backend_plan:
         fa_mod = load_flash_attn(enable_triton)
-        all_results.extend(benchmark(args, fa_mod, label))
+        all_results.extend(benchmark(args, fa_mod, label, include_sdpa=args.sdpa and label == backend_plan[0][0]))
 
     if args.plot:
         maybe_plot(all_results, args.plot_path)

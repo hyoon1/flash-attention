@@ -12,6 +12,8 @@ REPO_ROOT = Path(__file__).resolve().parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+SPECIAL_LENGTHS = [27280]
+
 
 def estimate_flops(batch, nheads, seqlen_q, seqlen_k, head_dim):
     # Rough dense attention FLOPs: QK^T + AV (softmax overhead ignored).
@@ -68,13 +70,21 @@ def run_once_varlen(seqlen_q, seqlen_k, batch, nheads, head_dim, dtype, causal, 
     return start.elapsed_time(end) / 1000.0  # seconds
 
 
-def make_lengths(min_len, max_len, step):
-    vals = {min_len}
-    for l in range(step, max_len + 1, step):
-        vals.add(l)
-    if max_len not in vals:
-        vals.add(max_len)
-    return sorted(vals)
+def make_lengths(min_len, max_len, step, extra_lens=None):
+    """Generate lengths starting at min_len, then step-based up to max_len, then append extras."""
+    extra_lens = extra_lens or []
+    lengths = [min_len]
+    l = step
+    while l <= max_len:
+        if l not in lengths:
+            lengths.append(l)
+        l += step
+    if lengths[-1] != max_len:
+        lengths.append(max_len)
+    for extra in extra_lens:
+        if extra not in lengths:
+            lengths.append(extra)
+    return lengths
 
 
 def run_sdpa(seqlen_q, seqlen_k, batch, nheads, head_dim, dtype, causal):
@@ -98,7 +108,7 @@ def format_config_label(args):
 
 
 def benchmark(args, fa_mod, backend_label, include_sdpa=False):
-    lengths = make_lengths(args.min_len, args.max_len, args.step)
+    lengths = make_lengths(args.min_len, args.max_len, args.step, extra_lens=SPECIAL_LENGTHS)
     config_label = format_config_label(args)
     meta = {
         "batch": args.batch,
@@ -190,7 +200,7 @@ def benchmark(args, fa_mod, backend_label, include_sdpa=False):
     return results
 
 
-def maybe_plot(results, out_path, config_label):
+def maybe_plot(results, out_path, config_label, highlight_lens=None):
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -198,6 +208,7 @@ def maybe_plot(results, out_path, config_label):
     except Exception:
         print("matplotlib not available; skipping plot")
         return
+    highlight_set = set(highlight_lens or [])
     series = {}
     for r in results:
         if r["TFLOPS"] is None:
@@ -209,6 +220,7 @@ def maybe_plot(results, out_path, config_label):
         series.setdefault(key, []).append(r)
     fig, ax = plt.subplots(figsize=(6, 4))
     markers = ["o", "s", "^", "x", "d"]
+    highlight_positions = []
     for idx, (key, vals) in enumerate(series.items()):
         vals_sorted = sorted(vals, key=lambda x: x["L"])
         ax.plot(
@@ -217,11 +229,22 @@ def maybe_plot(results, out_path, config_label):
             marker=markers[idx % len(markers)],
             label=key,
         )
+        if highlight_set:
+            specials = [r for r in vals_sorted if r["L"] in highlight_set]
+            if specials:
+                highlight_positions.extend([r["L"] for r in specials])
     ax.set_xlabel("Sequence length (Lq=Lk)")
     ax.set_ylabel("TFLOPS (approx)")
     ax.set_title("FlashAttention forward TFLOPS vs length")
     ax.grid(True)
     ax.legend()
+    # Draw dashed verticals to x-axis with labels near the bottom.
+    if highlight_positions:
+        y_min, y_max = ax.get_ylim()
+        y_text = y_min + 0.02 * (y_max - y_min)
+        for x in highlight_positions:
+            ax.axvline(x, color="crimson", linestyle="--", linewidth=1.0, alpha=0.8, zorder=4)
+            ax.text(x, y_text, f"L={x}", color="crimson", ha="center", va="bottom", fontsize=8, fontweight="bold")
     # Stamp run parameters on the figure so plots stay self-describing when shared.
     fig.text(0.5, 0.02, f"Config: {config_label}", ha="center", fontsize=9)
     fig.tight_layout(rect=[0, 0.04, 1, 1])
@@ -232,7 +255,12 @@ def maybe_plot(results, out_path, config_label):
 def parse_args():
     p = argparse.ArgumentParser(description="FlashAttention dense TFLOPS sweep (auto lengths)")
     p.add_argument("--min-len", type=int, default=1024, help="Smallest length to test")
-    p.add_argument("--max-len", type=int, default=27280, help="Largest length to test")
+    p.add_argument(
+        "--max-len",
+        type=int,
+        default=28672,
+        help="Largest length in the base sweep (extra lengths are added separately)",
+    )
     p.add_argument("--step", type=int, default=4096, help="Increment for lengths")
     p.add_argument("--batch", type=int, default=1, help="Batch size")
     p.add_argument("--nheads", type=int, default=24, help="Number of heads")
@@ -286,4 +314,4 @@ if __name__ == "__main__":
         all_results.extend(benchmark(args, fa_mod, label, include_sdpa=args.sdpa and label == backend_plan[0][0]))
 
     if args.plot:
-        maybe_plot(all_results, args.plot_path, config_label)
+        maybe_plot(all_results, args.plot_path, config_label, highlight_lens=SPECIAL_LENGTHS)

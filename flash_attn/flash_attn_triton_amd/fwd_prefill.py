@@ -282,7 +282,7 @@ def get_autotune_configs():
     else:
         return [
             triton.Config(
-                {"BLOCK_M": 64, "BLOCK_N": 32, "waves_per_eu": 6, "PRE_LOAD_V": False},
+                {"BLOCK_M": 64, "BLOCK_N": 32, "waves_per_eu": 8, "PRE_LOAD_V": False},
                 num_stages=1,
                 num_warps=4,
             ),

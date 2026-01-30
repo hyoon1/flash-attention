@@ -112,59 +112,82 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
         stride_alibi_slopes = alibi_slopes.dim() == 2 ? alibi_slopes.stride(0) : 0;
     }
 
-    return fmha_fwd_args{q.data_ptr(),
-                         k.data_ptr(),
-                         v.data_ptr(),
-                         alibi_slopes_ptr, // bias
-                         nullptr, // q_descale_ptr
-                         nullptr, // k_descale_ptr
-                         nullptr, // v_descale_ptr
-                         has_dropout_randval ? dropout_randval.data_ptr() : nullptr,
-                         has_lse ? softmax_lse.data_ptr() : nullptr,
-                         out.data_ptr(),
-                         seqlens_q.data_ptr(), // seqstart_q_ptr
-                         seqlens_k.data_ptr(), // seqstart_k_ptr
-                         nullptr,              // seqlen_q_ptr
-                         nullptr,              // seqlen_k_ptr
-                         nullptr,              // cu_seqlen_q_ptr
-                         nullptr,              // cu_seqlen_kv_ptr
-                         total_q,
-                         total_k,
-                         b,
-                         max_seqlen_q,
-                         d,             // hdim_q
-                         d,             // hdim_v
-                         h,             // nhead
-                         h_k,           // nhead_k
-                         softmax_scale, // scale_s
-                         0.0f,          // logits_soft_cap
-                         stride_q,
-                         stride_k,
-                         stride_v,
-                         stride_alibi_slopes,
-                         stride_randval,
-                         stride_o,
-                         nhead_stride_q,
-                         nhead_stride_k,
-                         nhead_stride_v,
-                         0, // nhead_stride_bias, FA without bias
-                         nhead_stride_randval,
-                         nhead_stride_lse,
-                         nhead_stride_o,
-                         batch_stride_q,
-                         batch_stride_k,
-                         batch_stride_v,
-                         0, // batch_stride_bias, FA without bias
-                         batch_stride_randval,
-                         batch_stride_lse,
-                         batch_stride_o,
-                         mask.left,
-                         mask.right,
-                         static_cast<ck_tile::index_t>(mask.type),
-                         0, // min_seqlen_q
-                         p_dropout,
-                         has_dropout_randval,
-                         drop_seed_offset};
+    fmha_fwd_args args{};
+    args.q_ptr = q.data_ptr();
+    args.k_ptr = k.data_ptr();
+    args.v_ptr = v.data_ptr();
+    args.bias_ptr = alibi_slopes_ptr;
+    args.q_descale_ptr = nullptr;
+    args.k_descale_ptr = nullptr;
+    args.v_descale_ptr = nullptr;
+    args.rand_val_ptr = has_dropout_randval ? dropout_randval.data_ptr() : nullptr;
+    args.lse_ptr = has_lse ? softmax_lse.data_ptr() : nullptr;
+    args.o_ptr = out.data_ptr();
+
+    args.seqstart_q_ptr = seqlens_q.data_ptr();
+    args.seqstart_k_ptr = seqlens_k.data_ptr();
+    args.seqlen_q_ptr = nullptr;
+    args.seqlen_k_ptr = nullptr;
+    args.cu_seqlen_q_ptr = nullptr;
+    args.cu_seqlen_k_ptr = nullptr;
+    args.block_scale_seqstart_q_ptr = nullptr;
+    args.block_scale_seqstart_k_ptr = nullptr;
+    args.sink_ptr = nullptr;
+
+    args.seqlen_q = total_q;
+    args.seqlen_k = total_k;
+    args.batch = b;
+    args.max_seqlen_q = max_seqlen_q;
+    args.hdim_q = d;
+    args.hdim_v = d;
+    args.nhead_q = h;
+    args.nhead_k = h_k;
+
+    args.scale_s = softmax_scale;
+    args.logits_soft_cap = 0.0f;
+
+    args.stride_q = stride_q;
+    args.stride_k = stride_k;
+    args.stride_v = stride_v;
+    args.stride_bias = stride_alibi_slopes;
+    args.stride_randval = stride_randval;
+    args.stride_o = stride_o;
+    args.nhead_stride_q = nhead_stride_q;
+    args.nhead_stride_k = nhead_stride_k;
+    args.nhead_stride_v = nhead_stride_v;
+    args.nhead_stride_bias = 0;
+    args.nhead_stride_randval = nhead_stride_randval;
+    args.nhead_stride_lse = nhead_stride_lse;
+    args.nhead_stride_o = nhead_stride_o;
+    args.nhead_stride_q_descale = 0;
+    args.nhead_stride_k_descale = 0;
+    args.nhead_stride_v_descale = 0;
+    args.batch_stride_q = batch_stride_q;
+    args.batch_stride_k = batch_stride_k;
+    args.batch_stride_v = batch_stride_v;
+    args.batch_stride_bias = 0;
+    args.batch_stride_randval = batch_stride_randval;
+    args.batch_stride_lse = batch_stride_lse;
+    args.batch_stride_o = batch_stride_o;
+    args.batch_stride_q_descale = 0;
+    args.batch_stride_k_descale = 0;
+    args.batch_stride_v_descale = 0;
+
+    args.window_size_left = mask.left;
+    args.window_size_right = mask.right;
+    args.sink_size = 0;
+    args.mask_type = static_cast<ck_tile::index_t>(mask.type);
+    args.min_seqlen_q = 0;
+
+    args.p_drop = p_dropout;
+    args.s_randval = has_dropout_randval;
+    args.drop_seed_offset =
+        std::pair<const void*, const void*>{drop_seed_offset.first, drop_seed_offset.second};
+
+    args.block_scale_size_q = 0;
+    args.block_scale_size_kv = 0;
+
+    return args;
 }
 
 fmha_fwd_splitkv_args get_ck_fmha_varlen_fwd_splitkv_args(bool has_lse,

@@ -448,14 +448,20 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
     at::cuda::CUDAGuard device_guard{q.device()};
 
     auto opts = q.options();
-    bool has_lse = true;
     bool has_dropout = p_dropout > 0.0f;
+    // Skip LSE write in pure inference (no grad, no dropout).
+    bool has_lse = at::GradMode::is_enabled() || has_dropout;
+    TORCH_CHECK(has_lse == (at::GradMode::is_enabled() || has_dropout),
+                "has_lse mismatch logic");
     if (has_dropout)
         TORCH_CHECK(!paged_KV, "Paged KV does not support dropout");
 
     at::Tensor softmax_lse;
-    // TODO - check gradient, only training require lse
-    softmax_lse = torch::empty({num_heads, total_q}, opts.dtype(torch::kFloat32));
+    if (has_lse) {
+        softmax_lse = torch::empty({num_heads, total_q}, opts.dtype(torch::kFloat32));
+    } else {
+        softmax_lse = torch::empty({0}, opts.dtype(torch::kFloat32));
+    }
 
     at::Tensor p;
     if (return_dropout_randval) {

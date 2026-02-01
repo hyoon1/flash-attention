@@ -267,12 +267,18 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     at::cuda::CUDAGuard device_guard{q.device()};
 
     auto opts = q.options();
-    bool has_lse = true;
     bool has_dropout = p_dropout > 0.0f;
+    // Skip LSE write in pure inference (no grad, no dropout).
+    bool has_lse = at::GradMode::is_enabled() || has_dropout;
+    TORCH_CHECK(has_lse == (at::GradMode::is_enabled() || has_dropout),
+                "has_lse mismatch logic");
 
     at::Tensor softmax_lse;
-    // TODO - check gradient, only training require lse
-    softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(torch::kFloat32));
+    if (has_lse) {
+        softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(torch::kFloat32));
+    } else {
+        softmax_lse = torch::empty({0}, opts.dtype(torch::kFloat32));
+    }
 
     at::Tensor p;
     if (return_dropout_randval) {

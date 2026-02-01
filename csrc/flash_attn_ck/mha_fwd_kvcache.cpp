@@ -405,8 +405,9 @@ mha_fwd_kvcache(at::Tensor &q,                                      // batch_siz
     auto opts = q.options();
 
     // TODO - check gradient, only training require lse
-    bool has_lse = true;
-    auto softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
+    bool has_lse = at::GradMode::is_enabled();
+    auto softmax_lse = has_lse ? torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat))
+                               : torch::empty({0}, opts.dtype(at::kFloat));
 
     int seqlen_knew = 0;
     at::Tensor k, v, k_padded, v_padded;

@@ -3,5 +3,5 @@
 	url = https://github.com/NVIDIA/cutlass.git
 [submodule "csrc/composable_kernel"]
 	path = csrc/composable_kernel
-	url = https://github.com/ROCm/composable_kernel.git
-	branch = amd-master
+	url = https://github.com/hyoon1/composable_kernel.git
+	branch = gfx1x-fmha-test

@@ -42,6 +42,7 @@ mha_varlen_fwd(at::Tensor &q,                               // total_q x num_hea
                const bool return_softmax,
                std::optional<at::Generator> gen_);
 
+#ifndef FLASH_ATTENTION_CK_FWD_ONLY
 std::vector<at::Tensor>
 mha_bwd(const at::Tensor &dout,                   // batch_size x seqlen_q x num_heads, x multiple_of(head_size_og, 8)
         const at::Tensor &q,                      // batch_size x seqlen_q x num_heads x head_size
@@ -110,13 +111,16 @@ mha_fwd_kvcache(at::Tensor &q,                                     // batch_size
                 const float softcap,
                 bool is_rotary_interleaved, // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
                 int num_splits);
+#endif // FLASH_ATTENTION_CK_FWD_ONLY
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
         m.doc() = "FlashAttention";
         m.def("fwd", &mha_fwd, "Forward pass");
         m.def("varlen_fwd", &mha_varlen_fwd, "Forward pass (variable length)");
+#ifndef FLASH_ATTENTION_CK_FWD_ONLY
         m.def("bwd", &mha_bwd, "Backward pass");
         m.def("varlen_bwd", &mha_varlen_bwd, "Backward pass (variable length)");
         m.def("fwd_kvcache", &mha_fwd_kvcache, "Forward pass, with KV-cache");
+#endif
 }

@@ -64,6 +64,7 @@ SKIP_CUDA_BUILD = os.getenv("FLASH_ATTENTION_SKIP_CUDA_BUILD", "FALSE") == "TRUE
 FORCE_CXX11_ABI = os.getenv("FLASH_ATTENTION_FORCE_CXX11_ABI", "FALSE") == "TRUE"
 USE_TRITON_ROCM = os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE"
 SKIP_CK_BUILD = os.getenv("FLASH_ATTENTION_SKIP_CK_BUILD", "TRUE") == "TRUE" if USE_TRITON_ROCM else False
+CK_FWD_ONLY = os.getenv("FLASH_ATTENTION_CK_FWD_ONLY", "TRUE").upper() == "TRUE"
 NVCC_THREADS = os.getenv("NVCC_THREADS") or "4"
 
 @functools.lru_cache(maxsize=None)
@@ -197,7 +198,21 @@ def rename_cpp_to_cu(cpp_files):
 
 def validate_and_update_archs(archs):
     # List of allowed architectures
-    allowed_archs = ["native", "gfx90a", "gfx950", "gfx942"]
+    allowed_archs = [
+        "native",
+        "gfx90a",
+        "gfx942",
+        "gfx950",
+        "gfx1030",
+        "gfx1100",
+        "gfx1101",
+        "gfx1102",
+        "gfx1150",
+        "gfx1151",
+        "gfx11-generic",
+        "gfx1200",
+        "gfx1201",
+    ]
 
     # Validate if each element in archs is in allowed_archs
     assert all(
@@ -382,10 +397,44 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
             os.makedirs("build")
 
         optdim = os.getenv("OPT_DIM", "32,64,128,256")
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd_appendkv", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd_splitkv", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "bwd", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
+        archs = [arch.lower() for arch in os.getenv("GPU_ARCHS", "native").split(";")]
+        validate_and_update_archs(archs)
+
+        detected_arch = None
+        if archs != ['native']:
+            kernel_targets = archs
+        else:
+            if not torch.cuda.is_available():
+                raise RuntimeError(
+                    "GPU_ARCHS not provided and no ROCm device detected. "
+                    "Set GPU_ARCHS (e.g., gfx1100) to target your GPU."
+                )
+            detected_arch = torch.cuda.get_device_properties(
+                torch.cuda.current_device()
+            ).gcnArchName.split(":")[0]
+            kernel_targets = [detected_arch.lower()]
+            validate_and_update_archs(kernel_targets)
+
+        targets_arg = ",".join(kernel_targets)
+        ck_codegen_dirs = ["fwd"] if CK_FWD_ONLY else ["fwd", "fwd_appendkv", "fwd_splitkv", "bwd"]
+        for direction in ck_codegen_dirs:
+            subprocess.run(
+                [
+                    sys.executable,
+                    f"{ck_dir}/example/ck_tile/01_fmha/generate.py",
+                    "-d",
+                    direction,
+                    "--output_dir",
+                    "build",
+                    "--receipt",
+                    "2",
+                    "--optdim",
+                    optdim,
+                    "--targets",
+                    targets_arg,
+                ],
+                check=True,
+            )
 
         # Check, if ATen/CUDAGeneratorImpl.h is found, otherwise use ATen/cuda/CUDAGeneratorImpl.h
         # See https://github.com/pytorch/pytorch/pull/70650
@@ -395,14 +444,7 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
             generator_flag = ["-DOLD_GENERATOR_PATH"]
 
         check_if_rocm_home_none("flash_attn")
-        archs = os.getenv("GPU_ARCHS", "native").split(";")
-        validate_and_update_archs(archs)
-
-        if archs != ['native']:
-            cc_flag = [f"--offload-arch={arch}" for arch in archs]
-        else:
-            arch = torch.cuda.get_device_properties("cuda").gcnArchName.split(":")[0]
-            cc_flag = [f"--offload-arch={arch}"]
+        cc_flag = [f"--offload-arch={arch}" for arch in kernel_targets]
 
         # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
         # torch._C._GLIBCXX_USE_CXX11_ABI
@@ -410,15 +452,21 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
         if FORCE_CXX11_ABI:
             torch._C._GLIBCXX_USE_CXX11_ABI = True
 
-        sources = ["csrc/flash_attn_ck/flash_api.cpp",
-                "csrc/flash_attn_ck/flash_common.cpp",
+        sources = [
+            "csrc/flash_attn_ck/flash_api.cpp",
+            "csrc/flash_attn_ck/flash_common.cpp",
+            "csrc/flash_attn_ck/mha_fwd.cpp",
+            "csrc/flash_attn_ck/mha_varlen_fwd.cpp",
+        ]
+
+        if not CK_FWD_ONLY:
+            sources += [
                 "csrc/flash_attn_ck/mha_bwd.cpp",
                 "csrc/flash_attn_ck/mha_fwd_kvcache.cpp",
-                "csrc/flash_attn_ck/mha_fwd.cpp",
                 "csrc/flash_attn_ck/mha_varlen_bwd.cpp",
-                "csrc/flash_attn_ck/mha_varlen_fwd.cpp"] + glob.glob(
-            f"build/fmha_*wd*.cpp"
-        )
+            ]
+
+        sources += glob.glob("build/fmha_*wd*.cpp")
 
         # Check if torch is using hipify v2. Until CK is updated with HIPIFY_V2 macro,
         # we must replace the incorrect APIs.
@@ -428,13 +476,9 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
 
         rename_cpp_to_cu(sources)
 
-        renamed_sources = ["csrc/flash_attn_ck/flash_api.cu",
-                        "csrc/flash_attn_ck/flash_common.cu",
-                        "csrc/flash_attn_ck/mha_bwd.cu",
-                        "csrc/flash_attn_ck/mha_fwd_kvcache.cu",
-                        "csrc/flash_attn_ck/mha_fwd.cu",
-                        "csrc/flash_attn_ck/mha_varlen_bwd.cu",
-                        "csrc/flash_attn_ck/mha_varlen_fwd.cu"] + glob.glob(f"build/fmha_*wd*.cu")
+        renamed_sources = [Path(src).with_suffix(".cu").as_posix() for src in sources] + glob.glob(
+            "build/fmha_*wd*.cu"
+        )
 
         cc_flag += ["-O3","-std=c++20",
                     "-DCK_TILE_FMHA_FWD_FAST_EXP2=1",
@@ -467,9 +511,11 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
         if hip_version > Version('6.2.41133') and hip_version < Version('6.3.00000'):
             cc_flag += ["-mllvm", "-amdgpu-coerce-illegal-types=1"]
 
+        ck_fwd_only_flag = ["-DFLASH_ATTENTION_CK_FWD_ONLY"] if CK_FWD_ONLY else []
+
         extra_compile_args = {
-            "cxx": ["-O3", "-std=c++20"] + generator_flag + maybe_hipify_v2_flag,
-            "nvcc": cc_flag + generator_flag + maybe_hipify_v2_flag,
+            "cxx": ["-O3", "-std=c++20"] + generator_flag + maybe_hipify_v2_flag + ck_fwd_only_flag,
+            "nvcc": cc_flag + generator_flag + maybe_hipify_v2_flag + ck_fwd_only_flag,
         }
 
         include_dirs = [

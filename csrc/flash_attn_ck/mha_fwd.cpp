@@ -259,9 +259,17 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     at::cuda::CUDAGuard device_guard{q.device()};
 
     auto opts = q.options();
+    const bool needs_grad = q.requires_grad() || k.requires_grad() || v.requires_grad();
+#ifdef FLASH_ATTENTION_CK_FWD_ONLY
     TORCH_CHECK(p_dropout == 0.0f, "CK fwd-only build supports p_dropout=0");
-    bool has_lse = false;      // CK gfx11 fwd kernels don't produce LSE
-    bool has_dropout = false;  // Dropout kernels not generated in this build
+    // FWD-only build: always prefer NLSE kernels.
+    bool has_lse = false;
+    bool has_dropout = false;
+#else
+    // In non fwd-only builds, use LSE when gradients or softmax/dropout outputs are needed.
+    bool has_lse = needs_grad || return_dropout_randval || return_softmax;
+    bool has_dropout = p_dropout > 0.0f;
+#endif
 
     // Still allocate softmax_lse to satisfy the Python interface shape.
     at::Tensor softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(torch::kFloat32));

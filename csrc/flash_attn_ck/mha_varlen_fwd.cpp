@@ -440,12 +440,20 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
     at::cuda::CUDAGuard device_guard{q.device()};
 
     auto opts = q.options();
+    const bool needs_grad = q.requires_grad() || k.requires_grad() || v.requires_grad();
+#ifdef FLASH_ATTENTION_CK_FWD_ONLY
     TORCH_CHECK(p_dropout == 0.0f, "CK fwd-only build supports p_dropout=0");
-    bool has_lse = false;      // CK gfx11 fwd kernels don't produce LSE
-    bool has_dropout = false;  // Dropout kernels not generated in this build
+    // FWD-only build: prefer NLSE kernels when no backward is needed.
+    bool has_lse = false;
+    bool has_dropout = false;
+#else
+    // Non fwd-only builds still default to NLSE for inference (no grads).
+    bool has_lse = needs_grad || return_dropout_randval || return_softmax;
+    bool has_dropout = p_dropout > 0.0f;
     if (has_dropout) {
         TORCH_CHECK(!paged_KV, "Paged KV does not support dropout");
     }
+#endif
 
     // Still allocate softmax_lse to satisfy the Python interface shape.
     at::Tensor softmax_lse = torch::empty({num_heads, total_q}, opts.dtype(torch::kFloat32));

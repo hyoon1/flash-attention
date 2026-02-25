@@ -35,24 +35,39 @@ def measure_with_repeats(run_kernel, burn_in, repeat):
     return start.elapsed_time(end) / repeat / 1000.0  # seconds
 
 
-def make_dense_runner(seqlen_q, seqlen_k, batch, nheads, head_dim, dtype, causal, fa_mod):
+def make_dense_runner(seqlen_q, seqlen_k, batch, nheads, head_dim, dtype, causal, fa_mod, layout):
     device = "cuda"
-    q = torch.randn(batch, seqlen_q, nheads, head_dim, device=device, dtype=dtype)
-    k = torch.randn(batch, seqlen_k, nheads, head_dim, device=device, dtype=dtype)
-    v = torch.randn(batch, seqlen_k, nheads, head_dim, device=device, dtype=dtype)
+    if layout == "bhsd":
+        # Head-major physical layout: allocate B,H,S,D and view as B,S,H,D
+        q = torch.randn(batch, nheads, seqlen_q, head_dim, device=device, dtype=dtype).permute(0, 2, 1, 3)
+        k = torch.randn(batch, nheads, seqlen_k, head_dim, device=device, dtype=dtype).permute(0, 2, 1, 3)
+        v = torch.randn(batch, nheads, seqlen_k, head_dim, device=device, dtype=dtype).permute(0, 2, 1, 3)
+    else:
+        q = torch.randn(batch, seqlen_q, nheads, head_dim, device=device, dtype=dtype)
+        k = torch.randn(batch, seqlen_k, nheads, head_dim, device=device, dtype=dtype)
+        v = torch.randn(batch, seqlen_k, nheads, head_dim, device=device, dtype=dtype)
     return lambda: fa_mod.flash_attn_func(
         q, k, v, dropout_p=0.0, softmax_scale=None, causal=causal, window_size=(-1, -1), deterministic=False
     )
 
 
-def make_varlen_runner(seqlen_q, seqlen_k, batch, nheads, head_dim, dtype, causal, fa_mod):
+def make_varlen_runner(seqlen_q, seqlen_k, batch, nheads, head_dim, dtype, causal, fa_mod, layout):
     device = "cuda"
     # Varlen expects packed [total, nheads, head_dim] and cu_seqlens
     total_q = seqlen_q * batch
     total_k = seqlen_k * batch
-    q = torch.randn(total_q, nheads, head_dim, device=device, dtype=dtype)
-    k = torch.randn(total_k, nheads, head_dim, device=device, dtype=dtype)
-    v = torch.randn(total_k, nheads, head_dim, device=device, dtype=dtype)
+    if layout == "bhsd":
+        # Head-major packed layout: tokens contiguous, heads separated by a large stride.
+        q = torch.empty_strided((total_q, nheads, head_dim), (head_dim, total_q * head_dim, 1), device=device, dtype=dtype)
+        k = torch.empty_strided((total_k, nheads, head_dim), (head_dim, total_k * head_dim, 1), device=device, dtype=dtype)
+        v = torch.empty_strided((total_k, nheads, head_dim), (head_dim, total_k * head_dim, 1), device=device, dtype=dtype)
+        q.normal_()
+        k.normal_()
+        v.normal_()
+    else:
+        q = torch.randn(total_q, nheads, head_dim, device=device, dtype=dtype)
+        k = torch.randn(total_k, nheads, head_dim, device=device, dtype=dtype)
+        v = torch.randn(total_k, nheads, head_dim, device=device, dtype=dtype)
     cu_q = torch.arange(0, total_q + 1, seqlen_q, device=device, dtype=torch.int32)
     cu_k = torch.arange(0, total_k + 1, seqlen_k, device=device, dtype=torch.int32)
     return lambda: fa_mod.flash_attn_varlen_func(
@@ -98,7 +113,7 @@ def make_sdpa_runner(seqlen_q, seqlen_k, batch, nheads, head_dim, dtype, causal)
 
 def format_config_label(args):
     causal = "causal" if args.causal else "noncausal"
-    return f"B{args.batch} H{args.nheads} d{args.head_dim} {args.dtype} {causal}"
+    return f"B{args.batch} H{args.nheads} d{args.head_dim} {args.dtype} {causal} layout={args.layout}"
 
 
 def benchmark(args, fa_mod, backend_label, include_sdpa=False):
@@ -110,13 +125,14 @@ def benchmark(args, fa_mod, backend_label, include_sdpa=False):
         "head_dim": args.head_dim,
         "dtype": args.dtype,
         "causal": args.causal,
+        "layout": args.layout,
     }
     print(f"Backend={backend_label}  Lengths={lengths}  Config={config_label}")
     results = []
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
     runner_factories = {
-        "dense": lambda l: make_dense_runner(l, l, args.batch, args.nheads, args.head_dim, dtype, args.causal, fa_mod),
-        "varlen": lambda l: make_varlen_runner(l, l, args.batch, args.nheads, args.head_dim, dtype, args.causal, fa_mod),
+        "dense": lambda l: make_dense_runner(l, l, args.batch, args.nheads, args.head_dim, dtype, args.causal, fa_mod, args.layout),
+        "varlen": lambda l: make_varlen_runner(l, l, args.batch, args.nheads, args.head_dim, dtype, args.causal, fa_mod, args.layout),
     }
     for mode, factory in runner_factories.items():
         print(f"--- {mode} ---")
@@ -227,6 +243,8 @@ def parse_args():
     p.add_argument("--head-dim", type=int, default=128, help="Head dimension")
     p.add_argument("--dtype", choices=["fp16", "bf16"], default="bf16", help="Dtype to benchmark")
     p.add_argument("--causal", action="store_true", help="Use causal mask")
+    p.add_argument("--layout", choices=["bshd", "bhsd"], default="bshd",
+                   help="Input layout: bshd (seq-major) or bhsd (head-major physical layout)")
     p.add_argument("--repeat", type=int, default=20, help="Repeats per point; avg is reported")
     p.add_argument("--burn-in", type=int, default=5, help="Warmup runs (ignored) per length")
     p.add_argument("--plot", action="store_true", help="Save matplotlib plot to PNG")

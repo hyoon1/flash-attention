@@ -33,6 +33,7 @@ AMD_LLC_CACHE_SIZES: Dict[str, int] = {
     "gfx1100": 96 * 1024 * 1024,   # RX 7900 XTX - 96 MB Infinity Cache
     "gfx1101": 64 * 1024 * 1024,   # RX 7800 XT - 64 MB Infinity Cache
     "gfx1102": 32 * 1024 * 1024,   # RX 7600 - 32 MB Infinity Cache
+    "gfx1151": 32 * 1024 * 1024,   # 32 MB Infinity Cache
     # RDNA4
     "gfx1200": 32 * 1024 * 1024,   # RX 9060/XT - 32 MB Infinity Cache
     "gfx1201": 64 * 1024 * 1024,   # RX 9070/XT - 64 MB Infinity Cache

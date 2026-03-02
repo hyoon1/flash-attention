@@ -1666,8 +1666,8 @@ def _attention_forward_prefill_triton_impl_core(
 
     # Detect if we need to force masking for all blocks (required on some architectures)
     arch = get_arch()
-    #force_masking = arch.is_rdna
-    force_masking = False
+    force_masking = arch.is_rdna
+    #force_masking = False
 
     # launch kernel
     grid = lambda META: (batch, nheads_q, triton.cdiv(max_seqlens_q, META["BLOCK_M"]))

@@ -494,8 +494,10 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
 
         ck_tile_float_to_bfloat16_default = os.environ.get("CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT")
         if ck_tile_float_to_bfloat16_default is None:
-            has_gfx11_target = any(arch.startswith("gfx11") for arch in kernel_targets)
-            ck_tile_float_to_bfloat16_default = "0" if has_gfx11_target else "3"
+            has_gfx11_or_gfx12_target = any(
+                arch.startswith(("gfx11", "gfx12")) for arch in kernel_targets
+            )
+            ck_tile_float_to_bfloat16_default = "5" if has_gfx11_or_gfx12_target else "3"
         cc_flag += [f"-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={ck_tile_float_to_bfloat16_default}"]
 
         # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214

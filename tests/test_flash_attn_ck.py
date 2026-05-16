@@ -60,10 +60,7 @@ def is_bwd_supported(d, deterministic):
     if not is_bwd_hdim_supported(d):
         return False
 
-    if is_gfx11():
-        return False
-
-    if is_gfx12() and deterministic:
+    if is_gfx1x() and deterministic:
         return False
 
     return True
@@ -73,11 +70,8 @@ def get_bwd_unsupported_reason(d, deterministic):
     if is_bwd_hdim_supported(d) is False:
         return f"CK backward is not supported for head dim {d}."
 
-    if is_gfx11():
-        return "CK backward is not supported on gfx11."
-
-    if is_gfx12() and deterministic:
-        return "Deterministic CK backward is not supported on gfx12."
+    if is_gfx1x() and deterministic:
+        return "Deterministic CK backward is not supported on gfx11/gfx12."
 
     return "CK backward is not supported on this arch/configuration."
 

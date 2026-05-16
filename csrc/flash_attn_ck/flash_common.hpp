@@ -109,13 +109,9 @@ inline bool is_gfx1x_arch() {
 }
 
 inline void check_gfx1x_bwd_supported(bool deterministic) {
-    if (is_gfx11_arch()) {
-        TORCH_CHECK(false, "CK backward is not supported on gfx11.");
-    }
-
-    if (is_gfx12_arch() && deterministic) {
+    if (is_gfx1x_arch() && deterministic) {
         TORCH_CHECK(false,
-                    "Deterministic CK backward is not supported on gfx12. "
+                    "Deterministic CK backward is not supported on gfx11/gfx12. "
                     "Please rerun with deterministic=False.");
     }
 }

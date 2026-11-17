@@ -4,20 +4,18 @@ import math
 import hashlib
 import inspect
 import os
-from functools import partial
+from functools import cache, partial
 from typing import Type, Callable, Optional, Tuple, overload, NamedTuple
 
 import cutlass
 import cutlass.cute as cute
 
 from cutlass import Float32, Int32, const_expr
-from cutlass.cute import FastDivmodDivisor
+from cutlass.cute import FastDivmodDivisorV2
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import nvvm, llvm
 from cutlass.cute.runtime import from_dlpack
 
-
-import quack.activation
 
 _MIXER_ATTRS = ("__vec_size__",)
 
@@ -63,8 +61,8 @@ POLY_EX2 = {
     ),
 }
 
-_fa_clc_enabled: bool = os.environ.get("FA_CLC", "0") == "1"
 _fa_disable_2cta_enabled: bool = os.environ.get("FA_DISABLE_2CTA", "0") == "1"
+_fa_disable_s_ping_pong_enabled: bool = os.environ.get("FA_DISABLE_S_PING_PONG", "0") == "1"
 
 
 def _is_cuda_12() -> bool:
@@ -88,8 +86,8 @@ def _is_cuda_12() -> bool:
 _fa_disable_2cta_cuda12: bool = _is_cuda_12()
 
 
-def _get_use_clc_scheduler_default() -> bool:
-    return _fa_clc_enabled
+def _get_disable_s_ping_pong_default() -> bool:
+    return _fa_disable_s_ping_pong_enabled
 
 
 def _get_disable_2cta_default(is_fwd: bool = False) -> bool:
@@ -99,8 +97,62 @@ def _get_disable_2cta_default(is_fwd: bool = False) -> bool:
         return _fa_disable_2cta_enabled
 
 
+def _get_sm100_backend_override() -> Optional[bool]:
+    """FLASH_ATTENTION_SM100_BACKEND=swapab prefers the SM100 SwapAB decode kernel wherever it
+    can serve the call (others run the standard kernel); standard disables it; unset or "auto"
+    leaves it to the forward selector. Read per call."""
+    value = os.getenv("FLASH_ATTENTION_SM100_BACKEND", "auto")
+    overrides = {"auto": None, "swapab": True, "standard": False}
+    if value not in overrides:
+        raise ValueError("FLASH_ATTENTION_SM100_BACKEND must be auto, standard, or swapab")
+    return overrides[value]
+
+
+# The backward env knobs below are read once per process (the backward builds its selection
+# inputs on every call); code that changes one at runtime calls its cache_clear().
+
+
+def _env_choice(name: str, choices: tuple[int, ...]) -> Optional[int]:
+    """Integer choice of an environment variable; unset, "" or "auto" is None."""
+    value = os.getenv(name)
+    if value is None or value == "" or value == "auto":
+        return None
+    assert value.isdigit() and int(value) in choices, (
+        f"{name} must be one of {', '.join(map(str, choices))} or auto, got {value}"
+    )
+    return int(value)
+
+
+@cache
+def _get_bwd_pack_gqa_override() -> Optional[int]:
+    """FLASH_ATTENTION_BWD_PACK_GQA: 0 forces the SM100 backward query-head fold off, 1 on (the
+    fold chooser picks the pack), 2 / 4 force that many query heads per tile; unset or "auto"
+    leaves it to the chooser (NOTE [bwd pack_gqa] in pack_gqa.py)."""
+    return _env_choice("FLASH_ATTENTION_BWD_PACK_GQA", (0, 1, 2, 4))
+
+
+@cache
+def _get_bwd_head_loop_override() -> Optional[bool]:
+    """FLASH_ATTENTION_BWD_HEAD_LOOP=0/1 forces the SM100 hdim 256 backward head loop (one tile
+    per KV head over its query-head groups) off / on; unset or "auto" leaves it to the chooser."""
+    value = _env_choice("FLASH_ATTENTION_BWD_HEAD_LOOP", (0, 1))
+    return None if value is None else value == 1
+
+
+@cache
+def _get_bwd_tile_n_override() -> Optional[int]:
+    """Test knob: FLASH_ATTENTION_BWD_TILE_N=64 selects the 64-row KV tile per CTA on the SM100
+    2CTA backward (the layout the hd256 backward needs). Unset or 128 keeps the default."""
+    value = os.getenv("FLASH_ATTENTION_BWD_TILE_N")
+    if value is None or value == "":
+        return None
+    tile_n = int(value)
+    assert tile_n in (64, 128), f"FLASH_ATTENTION_BWD_TILE_N must be 64 or 128, got {value}"
+    return tile_n
+
+
 def _compute_base_hash(func: Callable) -> str:
-    """Compute hash from source code or bytecode and closure values."""
+    """Compute a hash from callable code and captured compile-time values."""
     try:
         data = inspect.getsource(func).encode()
     except (OSError, TypeError):
@@ -115,13 +167,22 @@ def _compute_base_hash(func: Callable) -> str:
         for cell in func.__closure__:
             hasher.update(repr(cell.cell_contents).encode())
 
+    # Factory-generated score/mask modifiers often capture specialization values
+    # as defaults instead of closure cells. Those values affect generated code and
+    # therefore must distinguish entries in the compile cache as well.
+    for attr in ("__defaults__", "__kwdefaults__"):
+        values = getattr(func, attr, None)
+        if values is not None:
+            hasher.update(attr.encode())
+            hasher.update(repr(values).encode())
+
     return hasher.hexdigest()
 
 
 def hash_callable(
     func: Callable, mixer_attrs: Tuple[str] = _MIXER_ATTRS, set_cute_hash: bool = True
 ) -> str:
-    """Hash a callable based on the source code or bytecode and closure values.
+    """Hash a callable based on its code and captured compile-time values.
     Fast-path: if the callable (or its __wrapped__ base) has a ``__cute_hash__``
     attribute, that value is returned immediately as the base hash, then
     metadata dunders are mixed in to produce the final dict-key hash.
@@ -197,8 +258,19 @@ def compute_softmax_scale_log2(softmax_scale, score_mod):
         return LOG2_E, softmax_scale
 
 
+@cute.jit
+def clamp_index(idx, seqlen_divmod: FastDivmodDivisorV2):
+    """Clamp a tile index into [0, seqlen) so aux_tensors loads from a partial tile stay in bounds.
+
+    Scores and mask values at clamped (out-of-bounds) positions are masked afterwards, so any
+    in-bounds index works; a min is one instruction per element where a modulo is a fastdivmod.
+    Requires seqlen >= 1, which holds wherever a tile is processed.
+    """
+    return cutlass.min(idx, seqlen_divmod.divisor - 1)
+
+
 def compute_fastdiv_mods(mQ, mK, qhead_per_kvhead, pack_gqa, aux_tensors, mPageTable=None):
-    """Compute FastDivmodDivisor pairs for aux_tensors index computation.
+    """Compute FastDivmodDivisorV2 pairs for aux_tensors index computation.
 
     Returns a (seqlen_q_divmod, seqlen_k_divmod) tuple, or None if aux_tensors is None.
     """
@@ -210,7 +282,7 @@ def compute_fastdiv_mods(mQ, mK, qhead_per_kvhead, pack_gqa, aux_tensors, mPageT
         if const_expr(mPageTable is None)
         else mK.shape[0] * mPageTable.shape[1]
     )
-    return (FastDivmodDivisor(seqlen_q), FastDivmodDivisor(seqlen_k))
+    return (FastDivmodDivisorV2(seqlen_q), FastDivmodDivisorV2(seqlen_k))
 
 
 def convert_from_dlpack(x, leading_dim, alignment=16, divisibility=1) -> cute.Tensor:
@@ -780,10 +852,8 @@ def ex2_emulation_2(
     xy_rounded = cute.arch.add_packed_f32x2(xy_clamped, (fp32_round_int, fp32_round_int), rnd="rm")
     # The integer floor of x & y are now in the last 8 bits of xy_rounded
     # We want the next 2 ops to round to nearest even. The rounding mode is important.
-    xy_rounded_back = quack.activation.sub_packed_f32x2(
-        xy_rounded, (fp32_round_int, fp32_round_int)
-    )
-    xy_frac = quack.activation.sub_packed_f32x2(xy_clamped, xy_rounded_back)
+    xy_rounded_back = cute.arch.sub_packed_f32x2(xy_rounded, (fp32_round_int, fp32_round_int))
+    xy_frac = cute.arch.sub_packed_f32x2(xy_clamped, xy_rounded_back)
     xy_frac_ex2 = evaluate_polynomial_2(*xy_frac, POLY_EX2[poly_degree], loc=loc, ip=ip)
     x_out = combine_int_frac_ex2(xy_rounded[0], xy_frac_ex2[0], loc=loc, ip=ip)
     y_out = combine_int_frac_ex2(xy_rounded[1], xy_frac_ex2[1], loc=loc, ip=ip)
@@ -966,76 +1036,3 @@ def get_batch_from_cu_tensor(idx: Int32, cu_tensor: cute.Tensor) -> Int32:
             hi = mid
 
     return lo
-
-
-def as_bshkrd_tensor(
-    tensor: cute.Tensor,
-    h_k: Int32,
-    h_r: Int32,
-    varlen: bool,
-) -> cute.Tensor:
-    """Normalize (B,S,H,D)/(S,H,D) tensors to (B,S,H_k,H_r,D) view."""
-    if cutlass.const_expr(cute.rank(tensor.layout) == 5):
-        return tensor
-    if cutlass.const_expr(cute.rank(tensor.layout) == 4):
-        return cute.make_tensor(
-            tensor.iterator,
-            cute.make_layout(
-                (tensor.shape[0], tensor.shape[1], h_k, h_r, tensor.shape[3]),
-                stride=(
-                    tensor.stride[0],
-                    tensor.stride[1],
-                    tensor.stride[2] * h_r,
-                    tensor.stride[2],
-                    tensor.stride[3],
-                ),
-            ),
-        )
-    assert cutlass.const_expr(cute.rank(tensor.layout) == 3), "Expected rank-3 varlen tensor"
-    assert cutlass.const_expr(varlen), "Rank-3 input is only valid for varlen"
-    return cute.make_tensor(
-        tensor.iterator,
-        cute.make_layout(
-            (1, tensor.shape[0], h_k, h_r, tensor.shape[2]),
-            stride=(
-                0,
-                tensor.stride[0],
-                tensor.stride[1] * h_r,
-                tensor.stride[1],
-                tensor.stride[2],
-            ),
-        ),
-    )
-
-
-def as_shhb_tensor(
-    tensor: cute.Tensor,
-    h_k: Int32,
-    h_r: Int32,
-    b: Int32,
-    varlen: bool,
-) -> cute.Tensor:
-    """Normalize (B,H,S)/(H,S) tensors to (S, ((H_r, H_k), B)) view."""
-    if cutlass.const_expr(cute.rank(tensor.layout) == 3):
-        return cute.make_tensor(
-            tensor.iterator,
-            cute.make_layout(
-                (tensor.shape[2], ((h_r, h_k), tensor.shape[0])),
-                stride=(
-                    tensor.stride[2],
-                    ((tensor.stride[1], tensor.stride[1] * h_r), tensor.stride[0]),
-                ),
-            ),
-        )
-    assert cutlass.const_expr(cute.rank(tensor.layout) == 2), "Expected rank-2 varlen tensor"
-    assert cutlass.const_expr(varlen), "Rank-2 input is only valid for varlen"
-    return cute.make_tensor(
-        tensor.iterator,
-        cute.make_layout(
-            (tensor.shape[1], ((h_r, h_k), b)),
-            stride=(
-                tensor.stride[1],
-                ((tensor.stride[0], tensor.stride[0] * h_r), 0),
-            ),
-        ),
-    )

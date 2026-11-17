@@ -2,7 +2,7 @@
 
 import math
 import operator
-from typing import Tuple
+from typing import Optional, Tuple
 from dataclasses import dataclass
 
 import cutlass
@@ -14,6 +14,66 @@ import flash_attn.cute.utils as utils
 from quack.cute_dsl_utils import ParamsBase
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.utils import AuxData
+
+
+@cute.jit
+def load_learnable_sink(
+    learnable_sink: cute.Tensor,
+    head_idx,
+    packed_row,
+    qhead_per_kvhead: cutlass.Constexpr[int],
+    pack_gqa: cutlass.Constexpr[bool],
+    qhead_per_kvhead_valid: cutlass.Constexpr[Optional[int]] = None,
+) -> Float32:
+    """Load the sink logit for one output row; see `apply_learnable_sink`.
+
+    With pack_gqa the M tile interleaves the Q heads of one KV head, so `head_idx` is the KV
+    head and the Q head is `packed_row % qhead_per_kvhead`; otherwise `head_idx` is already
+    the Q head and `packed_row` is ignored.
+    Padded Q heads get -inf (no sink); see `pack_gqa.qheads_first_tma_view`.
+    """
+    if cutlass.const_expr(not pack_gqa):
+        return Float32(learnable_sink[head_idx])
+    if cutlass.const_expr(qhead_per_kvhead_valid is None):
+        qhead_per_kvhead_valid = qhead_per_kvhead
+    qhead = packed_row % qhead_per_kvhead
+    sink_val = -Float32.inf
+    if qhead < qhead_per_kvhead_valid:
+        sink_val = Float32(learnable_sink[head_idx * qhead_per_kvhead_valid + qhead])
+    return sink_val
+
+
+@cute.jit
+def apply_learnable_sink(
+    row_max: Float32,
+    row_sum: Float32,
+    sink_val: Float32,
+    scale_log2: Float32,
+    max_offset: Float32 = 0.0,
+    empty_row_sum: Float32 = 1.0,
+) -> tuple[Float32, Float32]:
+    """Fold a learnable sink logit into the final (unscaled row_max, row_sum) softmax stats.
+
+    A learnable sink is one extra softmax column per Q head with logit `sink_val` (natural-log
+    units, not multiplied by softmax_scale) and no value vector: it enlarges the normalizer
+    and the LSE but contributes nothing to O. Kernels fold it in at the end of the KV loop.
+    The stats are an *unscaled* row max and a row sum of exp2(score*scale_log2 - max*scale_log2)
+    terms, so the sink enters as exp2(sink*LOG2_E - row_max*scale_log2 + max_offset). A fully
+    masked row (row_max == -inf) has the sink as its only column, so its stats become
+    row_max = sink/scale (i.e. row_max*scale_log2 == sink*LOG2_E) and row_sum = empty_row_sum,
+    giving O = 0 and lse = sink. Backward: dsink[h] = -sum_rows exp(sink[h] - lse[row,h]) * dpsum[row,h].
+
+    `max_offset` is the fp8 exponent offset and `empty_row_sum == 2**max_offset` (0 and 1 for
+    bf16/fp16). `Softmax.finalize` (SM80/SM90) applies the same fold in the scaled domain.
+    """
+    if row_max == -Float32.inf:
+        row_max = sink_val * (utils.LOG2_E / scale_log2)
+        row_sum = empty_row_sum
+    else:
+        row_sum += cute.math.exp2(
+            sink_val * utils.LOG2_E - row_max * scale_log2 + max_offset, fastmath=True
+        )
+    return row_max, row_sum
 
 
 @cute.jit
@@ -493,7 +553,7 @@ def apply_score_mod_inner(
         qk_acc_dtype: Data type for accumulator
         aux_tensors: Optional aux_tensors for FlexAttention
         aux_scalars: Optional runtime scalar captures for FlexAttention
-        fastdiv_mods: Tuple of (seqlen_q_divmod, seqlen_k_divmod) for wrapping
+        fastdiv_mods: Tuple of (seqlen_q_divmod, seqlen_k_divmod) bounding aux_tensors indices
         seqlen_info: Sequence length info
         constant_q_idx: If provided, use this constant for all q_idx values
                         If None, compute q_idx per-element
@@ -538,20 +598,18 @@ def apply_score_mod_inner(
                 head_offset = q_idx_packed - q_idx_logical * qhead_per_kvhead
                 head_idx_vec[j] = head_idx * qhead_per_kvhead + head_offset
 
-            # If we will do loads we mod, in order to not read OOB
+            # If we will do loads we clamp, in order to not read OOB
             if cutlass.const_expr(aux_data.tensors is not None and fastdiv_mods is not None):
                 if cutlass.const_expr(constant_q_idx is None):
                     seqlen_q_divmod, seqlen_k_divmod = fastdiv_mods
                     q_idx_floored = floor_if_packed(
                         index_tensor[i + j][q_idx_pos], qhead_per_kvhead
                     )
-                    _, q_idx_wrapped = divmod(q_idx_floored, seqlen_q_divmod)
-                    q_idx_vec[j] = q_idx_wrapped
+                    q_idx_vec[j] = utils.clamp_index(q_idx_floored, seqlen_q_divmod)
                 else:
                     _, seqlen_k_divmod = fastdiv_mods
 
-                _, kv_idx_wrapped = divmod(index_tensor[i + j][kv_idx_pos], seqlen_k_divmod)
-                kv_idx_vec[j] = kv_idx_wrapped
+                kv_idx_vec[j] = utils.clamp_index(index_tensor[i + j][kv_idx_pos], seqlen_k_divmod)
             else:
                 # No bounds checking - direct indexing
                 if constant_q_idx is None:
@@ -623,7 +681,7 @@ def apply_score_mod_bwd_inner(
         qk_acc_dtype: Data type for accumulator
         aux_tensors: Optional aux_tensors for FlexAttention
         aux_scalars: Optional runtime scalar captures for FlexAttention
-        fastdiv_mods: Tuple of (seqlen_q_divmod, seqlen_k_divmod) for wrapping
+        fastdiv_mods: Tuple of (seqlen_q_divmod, seqlen_k_divmod) bounding aux_tensors indices
         seqlen_info: Sequence length info
         constant_q_idx: If provided, use this constant for all q_idx values
         qhead_per_kvhead: Pack-GQA replication factor
@@ -667,13 +725,11 @@ def apply_score_mod_bwd_inner(
                     q_idx_floored = floor_if_packed(
                         index_tensor[i + j][q_idx_pos], qhead_per_kvhead
                     )
-                    _, q_idx_wrapped = divmod(q_idx_floored, seqlen_q_divmod)
-                    q_idx_vec[j] = q_idx_wrapped
+                    q_idx_vec[j] = utils.clamp_index(q_idx_floored, seqlen_q_divmod)
                 else:
                     _, seqlen_k_divmod = fastdiv_mods
 
-                _, kv_idx_wrapped = divmod(index_tensor[i + j][kv_idx_pos], seqlen_k_divmod)
-                kv_idx_vec[j] = kv_idx_wrapped
+                kv_idx_vec[j] = utils.clamp_index(index_tensor[i + j][kv_idx_pos], seqlen_k_divmod)
             else:
                 # No bounds checking - direct indexing
                 if constant_q_idx is None:

@@ -12,9 +12,9 @@ from flash_attn.cute.interface import (
     flash_attn_func,
     _flash_attn_fwd,
     _flash_attn_bwd,
-    _tile_size_bwd_sm90,
 )
 from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
+from flash_attn.cute.config import select_sm90_bwd_tile
 
 COMPUTE_CAPABILITY = torch.cuda.get_device_capability()[0]
 
@@ -32,6 +32,7 @@ from score_mod_definitions import (
     score_mod_batch_bias as score_mod_10,
     score_mod_dual_buffer as score_mod_11,
     score_mod_global_kv_bias,
+    score_mod_global_q_and_kv_bias,
 )  # isort: split
 from score_mod_definitions import (
     score_mod_identity_vectorized as score_mod_1_vectorized,
@@ -168,6 +169,23 @@ def tensor_bias_and_scalar_scale_score_eager(batch_bias, scale: int):
     return score_mod
 
 
+def default_scale_score_mod(scale):
+    @cute.jit
+    def score_mod(
+        score,
+        b_idx,
+        h_idx,
+        q_idx,
+        kv_idx,
+        seqlen_info,
+        aux_tensors,
+        scale=scale,
+    ):
+        return score * cutlass.Float32(scale)
+
+    return score_mod
+
+
 def create_tensors(
     batch_size=2, num_heads=4, seqlen_q=64, seqlen_kv=64, dim=128, dtype=torch.bfloat16
 ):
@@ -229,6 +247,37 @@ def test_score_mod_aux_cache_separates_dtype_and_layout(monkeypatch):
         ).transpose(1, 2)
         torch.testing.assert_close(out.float(), reference, atol=0.04, rtol=0.04)
     assert len(cache.cache) == 3
+
+
+def test_score_mod_defaults_separate_compile_cache(monkeypatch):
+    torch.manual_seed(0)
+    head_dim = 64
+    q, k, v = create_tensors(
+        batch_size=1,
+        num_heads=2,
+        seqlen_q=64,
+        seqlen_kv=64,
+        dim=head_dim,
+        dtype=torch.bfloat16,
+    )
+    scales = (1.0, 2.0)
+    cache = JITCache()
+    monkeypatch.setattr(_flash_attn_fwd, "compile_cache", cache)
+
+    outputs = [
+        run_cute_flash(q, k, v, default_scale_score_mod(scale)) for scale in scales
+    ]
+
+    scores = q.float() @ k.float().transpose(-1, -2) / math.sqrt(head_dim)
+    references = [
+        (torch.softmax(scores * scale, dim=-1) @ v.float()).to(q.dtype)
+        for scale in scales
+    ]
+    for out, reference in zip(outputs, references):
+        torch.testing.assert_close(out, reference, atol=0.025, rtol=0.025)
+
+    assert len(cache.cache) == 2
+    assert not torch.equal(outputs[0], outputs[1])
 
 
 @pytest.mark.parametrize("seqlen_q,seqlen_kv", SEQLEN_CONFIGS)
@@ -898,15 +947,15 @@ def test_sm90_block_sparse_score_mod_backward_with_dq_swapab():
     block_size_kv = 128
     dtype = torch.bfloat16
 
-    cfg = _tile_size_bwd_sm90(
+    tile = select_sm90_bwd_tile(
         dim,
         dim,
         causal=False,
         local=False,
         sparse_block_size_q=block_size_q,
     )
-    assert cfg.m_block_size == 80
-    assert cfg.dQ_swapAB
+    assert tile["tile_m"] == 80
+    assert tile["dQ_swapAB"]
 
     q, k, v = create_tensors(
         batch_size=batch_size,
@@ -1051,7 +1100,7 @@ def test_sm90_block_sparse_score_mod_backward_with_dq_swapab():
         (113, 203),
     ],
 )
-@pytest.mark.parametrize("dim", [64, 128])
+@pytest.mark.parametrize("dim", [64, 128, 256])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("score_mod_triple", BWD_TEST_PAIRS)
 @pytest.mark.parametrize("use_autograd", [True, False])
@@ -1121,7 +1170,7 @@ def make_aux_tensors_for_bwd(cute_score_mod, eager_factory, seqlen_q, num_heads,
         (256, 128),
     ],
 )
-@pytest.mark.parametrize("dim", [64, 128])
+@pytest.mark.parametrize("dim", [64, 128, 256])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("score_mod_triple", BWD_TEST_PAIRS_WITH_AUX)
 def test_cute_vs_flex_attention_backward_with_aux(
@@ -1180,8 +1229,46 @@ def test_cute_vs_flex_attention_backward_with_aux(
     assert cute_dv_err <= rtol * pt_dv_err + dv_atol, f"dV error too large: {cute_dv_err:.2e}"
 
 
+@pytest.mark.skipif(COMPUTE_CAPABILITY not in [10, 11], reason="SM100/SM110 aux-index bounds test")
+# Whole tiles of every size the kernels use, lengths that fill tile_m but not a two-stage or
+# 2-CTA work tile, and partial tiles on either side.
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_kv",
+    [(256, 256), (512, 1024), (384, 384), (640, 128), (128, 384), (255, 256), (256, 257), (113, 203)],
+)
+@pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(1, 2), (4, 2)])
+def test_score_mod_q_and_kv_aux_loads_backward(seqlen_q, seqlen_kv, qhead_per_kvhead, num_kv_heads):
+    """Captured tensors indexed by q_idx and by kv_idx, forward and backward, at lengths on
+    both sides of the tile boundaries where the kernels clamp aux-index bounds."""
+    torch.random.manual_seed(0)
+    dtype = torch.bfloat16
+    num_heads = num_kv_heads * qhead_per_kvhead
+    q, k, v = create_tensors(seqlen_q=seqlen_q, seqlen_kv=seqlen_kv, num_heads=num_heads, dtype=dtype)
+    k, v = k[:, :num_kv_heads].clone(), v[:, :num_kv_heads].clone()
+    q_bias = torch.randn(seqlen_q, device="cuda", dtype=dtype)
+    kv_bias = torch.randn(seqlen_kv, device="cuda", dtype=dtype)
+
+    def eager_score_mod(score, b, h, q_idx, kv_idx):
+        return score + q_bias[q_idx] + kv_bias[kv_idx]
+
+    out_cute, grad_out, dq_cute, dk_cute, dv_cute = run_cute_flash_bwd(
+        q, k, v, score_mod_global_q_and_kv_bias, score_mod_bwd_identity,
+        aux_tensors=[q_bias, kv_bias], pack_gqa=qhead_per_kvhead > 1,
+    )
+    ref_fp32 = run_flex_reference_bwd(q, k, v, eager_score_mod, grad_out, dtype=torch.float32)
+    ref_pt = run_flex_reference_bwd(q, k, v, eager_score_mod, grad_out)
+    for name, cute_t, ref, pt in zip(
+        ("out", "dq", "dk", "dv"), (out_cute, dq_cute, dk_cute, dv_cute), ref_fp32, ref_pt
+    ):
+        assert torch.isfinite(cute_t).all(), f"{name} is not finite"
+        atol = 2 * (ref + 0.3 - 0.3 - ref).abs().max().item()
+        pt_err = (pt - ref.to(dtype)).abs().max().item()
+        cute_err = (cute_t - ref.to(dtype)).abs().max().item()
+        assert cute_err <= 2 * pt_err + atol, f"{name}: CuTE error {cute_err:.2e}, PyTorch error {pt_err:.2e}"
+
+
 @pytest.mark.parametrize("seqlen_q,seqlen_kv", [(128, 128), (128, 256)])
-@pytest.mark.parametrize("dim", [64, 128])
+@pytest.mark.parametrize("dim", [64, 128, 256])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(4, 2)])
 @pytest.mark.parametrize("score_mod_triple", BWD_TEST_PAIRS_PACK_GQA)

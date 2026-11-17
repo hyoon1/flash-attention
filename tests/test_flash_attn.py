@@ -1,4 +1,5 @@
 import math
+import itertools
 
 import pytest
 import torch
@@ -2646,6 +2647,204 @@ def test_flash_attn_kvcache_paged_block_table_bounds(append_knew, paged_kv_block
     assert not out.isnan().any()
 
 
+@pytest.mark.skipif(USE_TRITON_ROCM, reason="the length check is only in the CUDA extension")
+def test_flash_attn_kvcache_cache_batch_idx_length():
+    # Regression test for issue #3097. The split-KV kernel reads cache_batch_idx[b] for every
+    # b < batch_size, so mha_fwd_kvcache must reject a cache_batch_idx whose length is not
+    # batch_size instead of reading past its end.
+    device = "cuda"
+    dtype = torch.float16
+    batch_size, seqlen_k, nheads, d = 4, 256, 2, 64
+    q = torch.randn(batch_size, 1, nheads, d, device=device, dtype=dtype)
+    k_cache = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype)
+    v_cache = torch.randn_like(k_cache)
+    # Slices of one buffer, as in the issue: the memory right after a short slice holds valid indices.
+    buf = torch.tensor([1, 0, 3, 2, 3], device=device, dtype=torch.int32)
+
+    for cache_batch_idx in (buf[:2], buf):  # 2 and 5 indices for 4 sequences
+        with pytest.raises(RuntimeError, match="cache_batch_idx must have shape"):
+            flash_attn_with_kvcache(q, k_cache, v_cache, cache_batch_idx=cache_batch_idx)
+
+    # Positive control: one index per sequence must NOT raise.
+    out = flash_attn_with_kvcache(q, k_cache, v_cache, cache_batch_idx=buf[:batch_size])
+    assert out.shape == (batch_size, 1, nheads, d)
+    assert not out.isnan().any()
+
+
+@pytest.mark.parametrize("append_knew", [False, True])
+def test_flash_attn_kvcache_paged_cuda_graph(append_knew):
+    torch.manual_seed(0)
+    device, dtype = "cuda", torch.float16
+    batch_size, nheads, nheads_k, d = 2, 4, 1, 64
+    page_size = 256
+    k_cache = torch.randn(4, page_size, nheads_k, d, device=device, dtype=dtype)
+    v_cache = torch.randn_like(k_cache)
+    block_table = torch.tensor([[0, 2], [1, 3]], device=device, dtype=torch.int32)
+    q = torch.randn(batch_size, 1, nheads, d, device=device, dtype=dtype)
+    k_new = torch.randn(batch_size, 1, nheads_k, d, device=device, dtype=dtype) if append_knew else None
+    v_new = torch.randn_like(k_new) if append_knew else None
+    cache_seqlens = torch.tensor([127, 256], device=device, dtype=torch.int32)
+
+    def run():
+        return flash_attn_with_kvcache(
+            q, k_cache, v_cache, k=k_new, v=v_new, cache_seqlens=cache_seqlens,
+            block_table=block_table, causal=True,
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = run()
+
+    # Replay with changed inputs, crossing a page boundary and reaching cache capacity.
+    for lengths in ([127, 256], [257, 512 - int(append_knew)]):
+        cache_seqlens.copy_(torch.tensor(lengths, device=device, dtype=torch.int32))
+        q.normal_()
+        graph.replay()
+        expected = run()
+        torch.testing.assert_close(out, expected, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("num_splits", [1, 0, 2])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("leftpad", [31, 95])
+@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("seqlen_q,seqlen_k", [(128, 256), (256, 512)])
+def test_flash_attn_kvcache_leftpad_no_seqlens(seqlen_q, seqlen_k, d, leftpad, causal, num_splits, dtype):
+    # Regression test for issue #3075: with cache_leftpad and cache_seqlens=None, seqlen_q and
+    # seqlen_k divide the block sizes but seqlen_k - cache_leftpad[b] need not, so the kernel
+    # must not take the Is_even_MN path (which skips masking the last key block).
+    device = "cuda"
+    torch.random.manual_seed(0)
+    batch_size, nheads = 3, 2
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
+    k_cache = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype)
+    v_cache = torch.randn_like(k_cache)
+    cache_leftpad = torch.tensor([leftpad, 0, 17], device=device, dtype=torch.int32)
+    arange = rearrange(torch.arange(seqlen_k, device=device), "s -> 1 s")
+    key_padding_mask = arange >= rearrange(cache_leftpad, "b -> b 1")
+    out = flash_attn_with_kvcache(
+        q, k_cache, v_cache, cache_leftpad=cache_leftpad, causal=causal, num_splits=num_splits
+    )
+    out_ref, _ = attention_ref(
+        q, k_cache, v_cache, None, key_padding_mask, causal=causal, key_leftpad=cache_leftpad
+    )
+    out_pt, _ = attention_ref(
+        q, k_cache, v_cache, None, key_padding_mask, causal=causal, upcast=False, reorder_ops=True,
+        key_leftpad=cache_leftpad,
+    )
+    print(f"Output max diff: {(out - out_ref).abs().max().item()}")
+    print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
+    assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item() + 1e-5
+
+
+@pytest.mark.parametrize("mode", ["dense", "varlen", "kvcache"])
+def test_flash_attn_cuda_graph_replay(mode):
+    """Capture one call of each entry point in a CUDA graph and replay it with new inputs.
+
+    A captured call may not synchronize with the host (.item(), .tolist()), must launch on
+    the capturing stream, and must read every per-sequence length from device memory, so a
+    replay must match eager execution on the same inputs. The paged KV cache is covered by
+    test_flash_attn_kvcache_paged_cuda_graph; this covers dense and varlen forward+backward
+    and the non-paged cache with rotary, cache_batch_idx and appended keys.
+    """
+    torch.manual_seed(0)
+    device, dtype = "cuda", torch.float16
+    batch_size, nheads, nheads_k, d = 2, 4, 1, 64
+    replays = []  # (set_inputs, active_rows) per replay
+
+    def randomize(*tensors):
+        with torch.no_grad():
+            for t in tensors:
+                t.normal_()
+
+    if mode == "dense":
+        q = torch.randn(batch_size, 256, nheads, d, device=device, dtype=dtype, requires_grad=True)
+        k = torch.randn(batch_size, 384, nheads_k, d, device=device, dtype=dtype, requires_grad=True)
+        v = torch.randn_like(k, requires_grad=True)
+        dout = torch.randn_like(q)
+
+        def run():
+            out = flash_attn_func(q, k, v, causal=True, deterministic=True)
+            return (out.detach(), *torch.autograd.grad(out, (q, k, v), dout))
+
+        replays = [(lambda: randomize(q, k, v, dout), None)] * 2
+    elif mode == "varlen":
+        capacity = 640
+        q = torch.randn(capacity, nheads, d, device=device, dtype=dtype, requires_grad=True)
+        k = torch.randn(capacity, nheads_k, d, device=device, dtype=dtype, requires_grad=True)
+        v = torch.randn_like(k, requires_grad=True)
+        dout = torch.randn_like(q)
+        # Static cu_seqlens buffer; only its device values change between replays.
+        cu_seqlens = torch.tensor([0, 256, 384, 640], device=device, dtype=torch.int32)
+
+        def run():
+            out = flash_attn_varlen_func(
+                q, k, v, cu_seqlens, cu_seqlens, capacity, capacity, causal=True, deterministic=True
+            )
+            return (out.detach(), *torch.autograd.grad(out, (q, k, v), dout))
+
+        def set_lengths(lengths):
+            cu_seqlens.copy_(torch.tensor([0, *itertools.accumulate(lengths)], device=device))
+            randomize(q, k, v, dout)
+
+        # Ragged tiles, an empty middle slot, and a single short sequence.
+        for lengths in ([256, 128, 256], [129, 0, 257], [64, 0, 0]):
+            replays.append((lambda lengths=lengths: set_lengths(lengths), sum(lengths)))
+    else:
+        capacity = 512
+        q = torch.randn(batch_size, 1, nheads, d, device=device, dtype=dtype)
+        k_cache = torch.randn(batch_size, capacity, nheads_k, d, device=device, dtype=dtype)
+        v_cache = torch.randn_like(k_cache)
+        k_new = torch.randn(batch_size, 1, nheads_k, d, device=device, dtype=dtype)
+        v_new = torch.randn_like(k_new)
+        angle = torch.rand(capacity, d // 2, device=device) * 2 * math.pi
+        rotary_cos, rotary_sin = angle.cos().to(dtype), angle.sin().to(dtype)
+        cache_batch_idx = torch.tensor([1, 0], device=device, dtype=torch.int32)
+        cache_seqlens = torch.tensor([127, 256], device=device, dtype=torch.int32)
+
+        def run():
+            return flash_attn_with_kvcache(
+                q, k_cache, v_cache, k=k_new, v=v_new, rotary_cos=rotary_cos, rotary_sin=rotary_sin,
+                cache_seqlens=cache_seqlens, cache_batch_idx=cache_batch_idx, causal=True,
+            )
+
+        def set_lengths(lengths):
+            cache_seqlens.copy_(torch.tensor(lengths, device=device, dtype=torch.int32))
+            randomize(q, k_new, v_new)
+
+        # Cross a tile boundary and append into the last slot of the cache.
+        for lengths in ([127, 256], [capacity - 1, 300]):
+            replays.append((lambda lengths=lengths: set_lengths(lengths), None))
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        static = run()
+    if not isinstance(static, tuple):
+        static = (static,)
+
+    for set_inputs, active_rows in replays:
+        set_inputs()
+        graph.replay()
+        expected = run()  # eager on the same inputs (re-appends the same keys to the same slots)
+        if not isinstance(expected, tuple):
+            expected = (expected,)
+        for got, want in zip(static, expected):
+            # Packed rows beyond cu_seqlens[-1] belong to no sequence and are undefined.
+            got, want = got[:active_rows], want[:active_rows]
+            torch.testing.assert_close(got, want, atol=1e-3, rtol=1e-3)
+
+
 @pytest.mark.skipif(USE_TRITON_ROCM, reason="compat-slot assert is only in the CUDA extension")
 def test_flash_attn_generator_arg_must_be_none():
     """The optional RNG `generator` slot is retained only for backwards-compat arg
@@ -2686,3 +2885,83 @@ def test_flash_attn_generator_arg_must_be_none():
     with pytest.raises(RuntimeError, match=match):
         flash_attn_gpu.varlen_bwd(qf, qf, kf, vf, qf, lse, None, None, None, cu, cu, None,
                                   seqlen, seqlen, 0.0, scale, False, True, -1, -1, 0.0, False, bad, None)
+
+
+def _skip_if_free_memory_below(gib):
+    free, _ = torch.cuda.mem_get_info()
+    if free < gib * 2**30:
+        pytest.skip(f"needs {gib} GiB of free GPU memory")
+
+
+def _with_row_stride(x, row_stride):
+    """The values of `x` (batch 1), with consecutive rows `row_stride` elements apart."""
+    _, seqlen, nheads, d = x.shape
+    buf = torch.empty((seqlen - 1) * row_stride + nheads * d, device=x.device, dtype=x.dtype)
+    y = buf.as_strided(x.shape, (seqlen * row_stride, row_stride, d, 1))
+    y.copy_(x)
+    return y
+
+
+@pytest.mark.parametrize("strided", ["k_cache", "v_cache", "k", "v"])
+def test_flash_attn_kvcache_large_row_stride(strided):
+    # The split-KV kernel steps K/V and the appended K/V back one block of kBlockN rows at a
+    # time. The step was truncated to 32 bits, so with a row stride of 2**31 / kBlockN or more
+    # every block after the first was loaded from the wrong address (#3096).
+    # d = 256 gives kBlockN = 64; 65 rows are two blocks, about 4.3 GB at this row stride.
+    _skip_if_free_memory_below(12)
+    torch.random.manual_seed(0)
+    device, dtype = "cuda", torch.bfloat16
+    nheads, d, row_stride = 2, 256, 2**25 + 128
+    append = strided in ("k", "v")
+    seqlen_k = seqlen_new = 65  # with append, the cache starts empty and receives k/v
+    q = torch.randn(1, 1, nheads, d, device=device, dtype=dtype)
+    k_cache = torch.randn(1, seqlen_k, nheads, d, device=device, dtype=dtype)
+    v_cache = torch.randn_like(k_cache)
+    k_new = torch.randn(1, seqlen_new, nheads, d, device=device, dtype=dtype) if append else None
+    v_new = torch.randn_like(k_new) if append else None
+    # One split, so the kernel steps from the second key block back to the first.
+    kwargs = dict(cache_batch_idx=torch.zeros(1, device=device, dtype=torch.int32), num_splits=1)
+    if append:
+        kwargs["cache_seqlens"] = 0
+
+    def run(strided_name):
+        args = {"k_cache": k_cache.clone(), "v_cache": v_cache.clone(), "k": k_new, "v": v_new}
+        if strided_name is not None:
+            args[strided_name] = _with_row_stride(args[strided_name], row_stride)
+        out = flash_attn_with_kvcache(q, args["k_cache"], args["v_cache"], k=args["k"], v=args["v"], **kwargs)
+        return out, args["k_cache"], args["v_cache"]
+
+    out_ref, k_cache_ref, v_cache_ref = run(None)
+    out, k_cache_out, v_cache_out = run(strided)
+    torch.cuda.synchronize()
+    # Same values in the same order: only the addresses differ.
+    assert torch.equal(out, out_ref)
+    assert torch.equal(k_cache_out, k_cache_ref)
+    assert torch.equal(v_cache_out, v_cache_ref)
+
+
+@pytest.mark.parametrize(
+    "seqlen_q,num_splits,free_gib",
+    [
+        # The out_accum offsets of splits 13-15 reach 2**31; b * h * seqlen_q * d stays below it.
+        (81920, 16, 16),
+        # b * h * seqlen_q * d > 2**31: split 1's out_accum offsets, and the combine kernel's
+        # per-split step and its row offsets for the last rows, reach 2**31.
+        (1114112, 2, 44),
+    ],
+)
+def test_flash_attn_kvcache_splitkv_large_accum(seqlen_q, num_splits, free_gib):
+    # The split-KV out_accum offsets and the combine kernel's offsets were 32-bit products
+    # (#3096). Compare against the unsplit kernel, which writes O directly.
+    _skip_if_free_memory_below(free_gib)
+    torch.random.manual_seed(0)
+    device, dtype = "cuda", torch.bfloat16
+    nheads, d = 8, 256
+    seqlen_k = num_splits * 64  # d = 256 gives kBlockN = 64: one key block per split
+    q = torch.randn(1, seqlen_q, nheads, d, device=device, dtype=dtype)
+    k_cache = torch.randn(1, seqlen_k, nheads, d, device=device, dtype=dtype)
+    v_cache = torch.randn_like(k_cache)
+    out = flash_attn_with_kvcache(q, k_cache, v_cache, num_splits=num_splits)
+    torch.cuda.synchronize()
+    out_ref = flash_attn_with_kvcache(q, k_cache, v_cache, num_splits=1)
+    torch.testing.assert_close(out, out_ref, atol=1e-2, rtol=1e-2)

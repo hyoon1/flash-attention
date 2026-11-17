@@ -31,6 +31,7 @@ from flash_attn.cute.interface import (
 
 DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
 IS_SM90 = torch.cuda.get_device_capability()[0] == 9
+IS_SM100 = torch.cuda.get_device_capability()[0] == 10
 INCREASED_TRIALS = False
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
@@ -51,7 +52,7 @@ INCREASED_TRIALS = False
 # @pytest.mark.parametrize("causal", [True])
 # @pytest.mark.parametrize("d", [64, 128])
 # @pytest.mark.parametrize("d", [128, 192])
-@pytest.mark.parametrize("d", [64, 128, 192])
+@pytest.mark.parametrize("d", [64, 128, 192, 256])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -79,6 +80,8 @@ def test_flash_attn_output(
     is_sm90 = torch.cuda.get_device_capability()[0] == 9
     if is_sm90 and d == 192:
         pytest.xfail("headdim 192 not supported on sm90")
+    if d == 256 and IS_SM90:
+        pytest.xfail("hdim > 192 backward: SM90 not supported yet")
     device = "cuda"
     # set seed
     torch.random.manual_seed(0)
@@ -220,7 +223,7 @@ def test_flash_attn_output(
                 v,
                 causal=causal,
                 # qv=qv,
-                # q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
+                # scales=TensorwiseScales(q_descale, k_descale, v_descale),
                 window_size=window_size,
                 # attention_chunk=attention_chunk,
                 softcap=softcap,
@@ -247,7 +250,11 @@ def test_flash_attn_output(
             and not dv > 256
             and not attention_chunk != 0
             and softcap == 0.0
-            and ((dv == d and d <= 128) or (d == 192 and dv == 128))
+            and (
+                (dv == d and d <= 128)
+                or (d == 192 and dv == 128)
+                or (IS_SM100 and d == 256 and dv == 256)
+            )
             and learnable_sink is None
             # and False
         ):
@@ -312,6 +319,7 @@ def test_flash_attn_output(
                     causal=causal,
                     window_size_left=window_size[0],
                     window_size_right=window_size[1],
+                    softcap=softcap,
                     deterministic=True,
                 )
 
@@ -368,7 +376,7 @@ def test_flash_attn_output(
 # @pytest.mark.parametrize('d', [56, 80])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128])
 # @pytest.mark.parametrize("d", [64, 96, 128])
-@pytest.mark.parametrize("d", [64, 128, 192])
+@pytest.mark.parametrize("d", [64, 128, 192, 256])
 # @pytest.mark.parametrize("d", [192])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
@@ -413,6 +421,8 @@ def test_flash_attn_varlen_output(
         pytest.xfail("bwd local attention not supported on sm90")
     if is_sm90 and d == 192:
         pytest.xfail("headdim 192 not supported on sm90")
+    if d == 256 and IS_SM90:
+        pytest.xfail("hdim > 192 backward: SM90 not supported yet")
     if (
         causal or local
     ):  # Right now reference only supports causal attention with seqlen_k == seqlen_q
@@ -619,8 +629,7 @@ def test_flash_attn_varlen_output(
             max_seqlen_k=seqlen_k,
             causal=causal,
             # qv=qv_unpad,
-            # q_descale=q_descale,
-            # k_descale=k_descale, v_descale=v_descale,
+            # scales=TensorwiseScales(q_descale, k_descale, v_descale),
             window_size=window_size,
             # attention_chunk=attention_chunk,
             learnable_sink=learnable_sink,
@@ -649,7 +658,11 @@ def test_flash_attn_varlen_output(
             and not has_qv
             and not dv > 256
             and not attention_chunk != 0
-            and ((dv == d and d <= 128) or (d == 192 and dv == 128))
+            and (
+                (dv == d and d <= 128)
+                or (d == 192 and dv == 128)
+                or (IS_SM100 and d == 256 and dv == 256)
+            )
             and not has_learnable_sink
             and not is_sm90
             # and False
@@ -750,6 +763,7 @@ def test_flash_attn_varlen_output(
                     causal=causal,
                     window_size_left=window_size[0],
                     window_size_right=window_size[1],
+                    softcap=softcap,
                     deterministic=True,
                     cu_seqlens_q=cu_seqlens_q,
                     cu_seqlens_k=cu_seqlens_k,
